@@ -791,6 +791,11 @@ class Envs:
     SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
+    # MemFabric (memfabric_hybrid) PD transfer: config store, transport
+    # protocol, and the host_rdma data-plane nic endpoint.
+    ASCEND_MF_STORE_URL = EnvStr(None)
+    ASCEND_MF_TRANSFER_PROTOCOL = EnvStr("sdma")
+    ASCEND_MF_HCOM_URL = EnvStr(None)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)

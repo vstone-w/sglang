@@ -1,7 +1,6 @@
 """Start bootstrap/kv-store-related server"""
 
 import logging
-import os
 
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -9,6 +8,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_kv_class,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
@@ -62,11 +62,16 @@ def maybe_create_ascend_config_store(transfer_backend: TransferBackend) -> None:
         get_parallel().node_rank == 0 and transfer_backend == TransferBackend.ASCEND
     ):
         return
+    store_url = envs.ASCEND_MF_STORE_URL.get()
+    if not store_url:
+        raise RuntimeError(
+            "ASCEND_MF_STORE_URL (e.g. tcp://<ip>:<port>) must be set for "
+            "the ascend disaggregation transfer backend."
+        )
     try:
         from memfabric_hybrid import create_config_store
 
-        ascend_url = os.getenv("ASCEND_MF_STORE_URL")
-        create_config_store(ascend_url)
+        create_config_store(store_url)
     except Exception as e:
         raise RuntimeError(
             f"Failed create mf store, invalid ascend_url. With exception {e}"
