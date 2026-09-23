@@ -19,11 +19,15 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopKConfig,
     _mask_topk_ids_padded_region,
+    _simulate_balanced_routing,
     _zero_topk_weights_padded_region,
     remap_topk_for_per_rank_shared_slots,
 )
-from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.layers.moe.utils import (
+    has_per_rank_fused_shared_slots,
+    is_moe_input_scattered_across_dp_ranks,
+)
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -249,6 +253,32 @@ class HashTopK(nn.Module):
 
         if self.apply_routed_scaling_factor_on_output:
             topk_weights = topk_weights * self.routed_scaling_factor
+
+        simulate_uniform = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+        simulate_round_robin = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+        if simulate_uniform and simulate_round_robin:
+            raise ValueError(
+                "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
+                "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
+            )
+        if simulate_uniform or simulate_round_robin:
+            if is_moe_input_scattered_across_dp_ranks():
+                parallel = get_parallel()
+                token_shard_rank = parallel.attn_dp_rank
+                num_token_shards = parallel.attn_dp_size
+            else:
+                token_shard_rank, num_token_shards = 0, 1
+            num_routed_cols = topk_ids.shape[1] - self.num_fused_shared_experts
+            if num_routed_cols > 0:
+                _simulate_balanced_routing(
+                    topk_ids[:, :num_routed_cols],
+                    topk_weights[:, :num_routed_cols],
+                    self.num_experts,
+                    random=simulate_uniform,
+                    layer_id=self.layer_id,
+                    token_shard_rank=token_shard_rank,
+                    num_token_shards=num_token_shards,
+                )
 
         num_fused_shared_experts = self.num_fused_shared_experts
         log2phy_prob = None
