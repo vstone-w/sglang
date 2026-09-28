@@ -142,10 +142,21 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         "validate_deepseek_v4_cp",
         moe_dense_tp_size=1,
     )
+    if cfg.attn_cp_size > 1:
+        attn_cp_size = cfg.attn_cp_size
+        logger.warning(
+            "DSV4 prefill CP using explicit attn_cp_size=%d (attn_tp=%d); "
+            "CP with attn_tp > 1 is unvalidated -- verify outputs against "
+            "a non-CP run.",
+            attn_cp_size,
+            cfg.tp_size // (cfg.dp_size * attn_cp_size),
+        )
+    else:
+        attn_cp_size = cfg.tp_size // cfg.dp_size
     declare_resolution(
         server_args,
         "validate_deepseek_v4_cp",
-        attn_cp_size=cfg.tp_size // cfg.dp_size,
+        attn_cp_size=attn_cp_size,
     )
     if not is_npu():
         assert cfg.dp_size == 1, (
