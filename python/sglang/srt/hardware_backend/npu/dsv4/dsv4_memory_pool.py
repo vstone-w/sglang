@@ -27,9 +27,11 @@ from sglang.srt.hardware_backend.npu.utils import (
     is_npu_arch35,
     npu_a5_kv_quant_path,
     require_mqsmla_ops,
-    use_npu_arch35_mqsmla_attn,
 )
-from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+    CACHE_MODE1_BANK_BLOCK_OFFSET,
+    CompressStatePool,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     ONLINE_C128,
     DeepSeekV4IndexerPool,
@@ -107,7 +109,9 @@ class NPUCompressStatePool(CompressStatePool):
 
     Location 0 is valid in explicit mode. Invalid/history-padding locations map
     to the final cleared row instead of ``-1`` because the A3 kernel consumes
-    unsigned offsets.
+    unsigned offsets. On A5 the official cache_mode=1 compressor skips writes
+    to state block 0, so request banks move one block past it; the trailing
+    ring-plus-row slack the shared pool already allocates holds that block.
     """
 
     def __init__(
@@ -148,30 +152,32 @@ class NPUCompressStatePool(CompressStatePool):
             state_cache_page_size=ring_size,
         )
         self.dummy_state_loc = self._size - 1
+        self.bank_block_offset = (
+            CACHE_MODE1_BANK_BLOCK_OFFSET if is_npu_arch35() else 0
+        )
+        self._bank_row_offset = self.bank_block_offset * self.ring_size
 
         # The shared pool initializes its dummy row. A cold C128 request bank
         # additionally needs every row initialized before its first partial use.
         if ratio == 128:
             self.kv_score_buffer.clear()
 
-    def _replace_invalid_with_dummy(self, state_loc: torch.Tensor) -> torch.Tensor:
+    def _to_bank_row(self, state_loc: torch.Tensor) -> torch.Tensor:
         return torch.where(
             state_loc < 0,
             torch.full_like(state_loc, self.dummy_state_loc),
-            state_loc,
+            state_loc + self._bank_row_offset,
         )
 
     def translate_from_swa_loc_to_state_loc(
         self, swa_loc: torch.Tensor
     ) -> torch.Tensor:
-        return self._replace_invalid_with_dummy(
-            super().translate_from_swa_loc_to_state_loc(swa_loc)
-        )
+        return self._to_bank_row(super().translate_from_swa_loc_to_state_loc(swa_loc))
 
     def translate_from_req_position_to_state_loc(
         self, req_pool_indices: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
-        return self._replace_invalid_with_dummy(
+        return self._to_bank_row(
             super().translate_from_req_position_to_state_loc(
                 req_pool_indices, positions
             )
@@ -183,7 +189,7 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
     get_contiguous_buf_infos / NSA) and ADDS dedicated int8 K + float16 scale
     buffers in PA_ND layout at the native C4 ``kernel_page_size``, written by
     ``torch_npu.npu_scatter_nd_update_`` and read by
-    ``torch.ops.custom.npu_quant_lightning_indexer``.
+    ``cann_ops_transformer.quant_lightning_indexer``.
     """
 
     def __init__(self, *args, kernel_page_size: int, **kwargs):
@@ -345,9 +351,10 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
         config = self.compressed_pool_configs[ratio]
         ring_size = self.get_ring_size(ratio)
-        # A5 cache_mode=2 addresses one ring bank per request.  The A3
+        # A5 cache_mode=1 addresses one ring bank per request.  The A3
         # explicit-location path can share the smaller flat pool, but the A5
-        # cycle ABI needs enough physical banks for every req_pool_idx.
+        # table needs a bank for every req_pool_idx; the shared pool's trailing
+        # ring-plus-row slack supplies the reserved block 0.
         size = config.state_size
         if is_npu_arch35():
             size = max(size, self.num_req_slots * ring_size)
@@ -469,9 +476,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:
         """FP32 ``[block_num, ring_size, 2*coff*D]`` view of this layer's
-        kv+score buffer — the fused compressor op
-        (``torch.ops.custom.compressor`` on A5 and ``torch.ops.npu.compressor``
-        elsewhere)'s ``state_cache`` argument."""
+        kv+score buffer — ``cann_ops_transformer.compressor``'s
+        ``state_cache`` argument."""
         return self._get_state_pool(layer_id, from_indexer).state_cache_3d
 
     # ------------------------------------------------------------------
@@ -528,7 +534,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         Routes to c4 / c128 kv_pool by layer compression ratio. Returns
         ``None`` for ratio == 0 (no compress KV exists). The
         from_indexer=True branch returns the dedicated quantized K buffer that
-        ``torch.ops.custom.npu_quant_lightning_indexer`` consumes.
+        ``cann_ops_transformer.quant_lightning_indexer`` consumes.
         """
         self.wait_layer_transfer(layer_id)
         item = self.layer_mapping[layer_id]
@@ -592,29 +598,18 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         if cache_2d.shape[0] == 0:
             return
         cfg = npu_a5_kv_quant_path()
-        if use_npu_arch35_mqsmla_attn():
-            _, _, writer_op = require_mqsmla_ops()
-            # The cann_ops_transformer writer scatters into the 4-D paged cache
-            # (blockNum, blockSize, 1, headDim) as raw bytes; rows are
-            # [rope bf16 128B][nope fp8 448B][scale 7x bf16 @576][pad -> 608B].
-            writer_op(
-                buf.view(torch.uint8),
-                cache_2d,
-                slot_mapping,
-                quant_group_size=cfg.quant_group_size,
-                quant_mode=cfg.writer_quant_mode,
-                round_scale=True,
-                x_scale=1.0,
-            )
-            return
-        torch.ops.npu.kv_compress_epilog(
-            buf.view(-1, 1, buf.shape[-1]),
+        _, _, writer_op = require_mqsmla_ops()
+        # The official writer scatters into the 4-D paged cache
+        # (blockNum, blockSize, 1, headDim) as raw bytes; rows are
+        # [rope bf16 128B][nope fp8 448B][scale 7x bf16 @576][pad -> 608B].
+        writer_op(
+            buf.view(torch.uint8),
             cache_2d,
             slot_mapping,
             quant_group_size=cfg.quant_group_size,
-            quant_mode=2,
-            round_scale_flag=True,
-            layout=1,
+            quant_mode=cfg.writer_quant_mode,
+            round_scale=True,
+            x_scale=1.0,
         )
 
     def set_swa_key_buffer_radix_fused_norm_rope(

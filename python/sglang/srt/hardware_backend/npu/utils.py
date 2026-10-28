@@ -1,6 +1,9 @@
+import contextlib
 import functools
 import logging
+import os
 import sys
+import threading
 from enum import IntEnum
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -59,10 +62,10 @@ def use_npu_arch35_mxfp8_wo_a(
 
 @functools.lru_cache(maxsize=1)
 def _mqsmla_ops() -> Optional[tuple]:
-    """Resolve the cann_ops_transformer mqsmla op trio, or None if unavailable.
+    """Resolve the official cann_ops_transformer mqsmla op trio.
 
-    Import success alone is not enough: older cann_ops_transformer builds
-    (CANN 9.1 era) lack the mqsmla ops, so the op attributes are probed too.
+    DSV4 requires the CANN 9.2 release; a missing package or op surfaces as
+    None here and turns into a fail-fast error in require_mqsmla_ops().
     Cached — the answer cannot change within a process.
     """
     try:
@@ -78,63 +81,35 @@ def _mqsmla_ops() -> Optional[tuple]:
         return None
 
 
-def use_npu_arch35_mqsmla_attn() -> bool:
-    """Whether A5 DSV4 attention runs the cann_ops_transformer mixed-quant ops.
-
-    SGLANG_NPU_USE_MQSMLA_ATTN selects the path when set (1 forces mqsmla and
-    fails fast if the ops are missing; 0 forces the sgl_kernel_npu kv-quant
-    path). Unset — the default — auto-selects by op presence: CANN 9.2 images
-    ship the mqsmla ops, CANN 9.1 images do not.
-    """
-    if not is_npu_arch35():
-        return False
-    if envs.SGLANG_NPU_USE_MQSMLA_ATTN.is_set():
-        return envs.SGLANG_NPU_USE_MQSMLA_ATTN.get()
-    return _mqsmla_ops() is not None
-
-
 @functools.lru_cache(maxsize=1)
 def _log_a5_kv_quant_selection() -> None:
-    """Log the A5 pooled-KV path once — the row format differs per path."""
-    if use_npu_arch35_mqsmla_attn():
-        logger.info(
-            "A5 DSV4 kv-quant: mqsmla path (cann_ops_transformer "
-            "mixed_quant_sparse_flash_mla + kv_compress_epilog, 608B rows "
-            "with bf16 group scales)"
-        )
-    else:
-        logger.info(
-            "A5 DSV4 kv-quant: sgl_kernel_npu kv-quant path (640B rows with "
-            "e8m0 scales)"
-        )
+    """Log the A5 pooled-KV row format once."""
+    logger.info(
+        "A5 DSV4 kv-quant: official cann_ops_transformer "
+        "mixed_quant_sparse_flash_mla + kv_compress_epilog, 608B rows with "
+        "bf16 group scales"
+    )
 
 
 def require_mqsmla_ops():
-    """The mqsmla op trio; only reached after use_npu_arch35_mqsmla_attn()."""
+    """The official mqsmla op trio; fail fast when the CANN 9.2 package is absent."""
     ops = _mqsmla_ops()
     if ops is None:
         raise RuntimeError(
-            "SGLANG_NPU_USE_MQSMLA_ATTN=1 (or the A5 op-presence auto-probe) "
-            "selected the mqsmla path, but the cann_ops_transformer ops "
+            "DSV4 requires the CANN 9.2 cann_ops_transformer ops "
             "(mixed_quant_sparse_flash_mla, mixed_quant_sparse_flash_mla_metadata, "
-            "kv_compress_epilog) cannot be resolved. Install/upgrade "
-            "cann_ops_transformer built from ops-transformer 9.2.0+, or set "
-            "SGLANG_NPU_USE_MQSMLA_ATTN=0 to force the sgl_kernel_npu "
-            "kv-quant path."
+            "kv_compress_epilog), but they cannot be resolved. Install "
+            "cann_ops_transformer built from ops-transformer 9.2.0+."
         )
     return ops
 
 
 class NpuA5KvQuantPath(msgspec.Struct, frozen=True):
-    """A5 pooled-KV row format and op dialect for one attention path.
+    """A5 pooled-KV row format for the official mqsmla ops.
 
-    Row bytes = nope + rope*2 + ceil(nope/group)*scale_itemsize, aligned up to
-    row_alignment. Field order inside the row differs per path (legacy:
-    nope|rope|e8m0 scale; mqsmla: rope|nope|bf16 scale) but the byte total
-    formula is shared. Layouts are fixed by the kernels on the other side:
-    sgl_kernel_npu kv_compress_epilog / npu_kv_quant_sparse_attn_sharedkv for
-    legacy, cann_ops_transformer kv_compress_epilog / mixed_quant_sparse_flash_mla
-    for mqsmla.
+    Row bytes = rope*2 + nope + ceil(nope/group)*bf16 scale, aligned up to
+    row_alignment; the reader is cann_ops_transformer
+    mixed_quant_sparse_flash_mla.
     """
 
     quant_group_size: int
@@ -142,17 +117,9 @@ class NpuA5KvQuantPath(msgspec.Struct, frozen=True):
     row_alignment: int
     reader_quant_mode: int
     reader_layout_kv: str
-    writer_quant_mode: str | None
+    writer_quant_mode: str
 
 
-NPU_A5_KV_QUANT_LEGACY = NpuA5KvQuantPath(
-    quant_group_size=64,
-    scale_itemsize=1,  # e8m0 byte
-    row_alignment=128,
-    reader_quant_mode=1,  # kv_quant_mode on the sgl_kernel_npu reader
-    reader_layout_kv="PA_ND",
-    writer_quant_mode=None,
-)
 NPU_A5_KV_QUANT_MQSMLA = NpuA5KvQuantPath(
     quant_group_size=64,
     scale_itemsize=2,  # bf16
@@ -165,11 +132,7 @@ NPU_A5_KV_QUANT_MQSMLA = NpuA5KvQuantPath(
 
 def npu_a5_kv_quant_path() -> NpuA5KvQuantPath:
     _log_a5_kv_quant_selection()
-    return (
-        NPU_A5_KV_QUANT_MQSMLA
-        if use_npu_arch35_mqsmla_attn()
-        else NPU_A5_KV_QUANT_LEGACY
-    )
+    return NPU_A5_KV_QUANT_MQSMLA
 
 
 class NPUACLFormat(IntEnum):
@@ -316,6 +279,117 @@ def set_default_server_args(args: "ServerArgs"):
             )
 
 
+def _prefer_package_common_headers() -> None:
+    """Make CANN op builds use this wheel's aclnn_common.h, not a vendor copy.
+
+    OpBuilder.include_paths() appends the package's common/ dir after every
+    vendor op_api/include dir. A site-packages vendor (deep_ep) ships a
+    different aclnn_common.h, so the compressor extension JIT-compiles against
+    the wrong aclnn ABI and its first call segfaults. Op-specific aclnn_*.h
+    headers are unaffected; only the wheel's own helper headers move first.
+    """
+    try:
+        from cann_ops_transformer.op_builder.builder import OpBuilder
+    except Exception:
+        return
+    if getattr(OpBuilder.include_paths, "_sglang_common_first", False):
+        return
+    original = OpBuilder.include_paths
+
+    def include_paths(self):
+        paths = original(self)
+        common = os.path.join(self._package_path, "common")
+        if os.path.isdir(common):
+            paths = [common] + [path for path in paths if path != common]
+        return paths
+
+    include_paths._sglang_common_first = True
+    OpBuilder.include_paths = include_paths
+
+
+# aclnn entry points in the CANN "customize" vendor (and similar cust-op
+# vendors) shadow the official libopapi_transformer.so implementations of these
+# ops -- the vendor copy uses an incompatible cache-row layout, so kv writes
+# land in the wrong pages. A cann_ops_transformer JIT extension resolves its
+# aclnn symbols once, on its first call, via GetOpApiFuncAddr, which scans
+# ASCEND_CUSTOM_OPP_PATH/LD_LIBRARY_PATH before the official libs.
+_OFFICIAL_OPAPI_OPS = (
+    "mixed_quant_sparse_flash_mla_metadata",
+    "mixed_quant_sparse_flash_mla",
+    "kv_compress_epilog",
+    "compressor",
+    "inplace_partial_rotary_mul",
+    "quant_lightning_indexer",
+    "quant_lightning_indexer_metadata",
+    "indexer_quant_cache",
+    "mhc_post",
+)
+
+
+@contextlib.contextmanager
+def _without_cust_opapi_vendors():
+    """Hide cust-op vendors from the env for one op call.
+
+    Other packages in the process (deep_ep) still resolve their own aclnn
+    symbols from their vendor, so this is a temporary view, not a removal.
+    """
+    saved_custom = os.environ.get("ASCEND_CUSTOM_OPP_PATH")
+    saved_ld = os.environ.get("LD_LIBRARY_PATH")
+    os.environ.pop("ASCEND_CUSTOM_OPP_PATH", None)
+    if saved_ld is not None:
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
+            d
+            for d in saved_ld.split(os.pathsep)
+            if not (d and os.path.exists(os.path.join(d, "libcust_opapi.so")))
+        )
+    try:
+        yield
+    finally:
+        if saved_custom is not None:
+            os.environ["ASCEND_CUSTOM_OPP_PATH"] = saved_custom
+        if saved_ld is not None:
+            os.environ["LD_LIBRARY_PATH"] = saved_ld
+
+
+def _guard_official_opapi_resolution(op, name: str):
+    """Resolve one extension's aclnn symbols from the official libs, once."""
+    done = False
+    lock = threading.Lock()
+
+    def guarded(*args, **kwargs):
+        nonlocal done
+        if done:
+            return op(*args, **kwargs)
+        with lock:
+            if done:
+                return op(*args, **kwargs)
+            with _without_cust_opapi_vendors():
+                result = op(*args, **kwargs)
+            done = True
+        logger.info(
+            "cann_ops_transformer.%s resolved against the official aclnn libs", name
+        )
+        return result
+
+    guarded._sglang_official_opapi_guard = True
+    return guarded
+
+
+def _install_official_opapi_guards() -> None:
+    """Keep CANN cust-op vendors from shadowing the official transformer ops."""
+    try:
+        import cann_ops_transformer  # noqa: F401  (registers the namespace)
+    except Exception as e:
+        logger.debug("cann_ops_transformer unavailable; no aclnn guards (%s)", e)
+        return
+    namespace = torch.ops.cann_ops_transformer
+    for name in _OFFICIAL_OPAPI_OPS:
+        op = getattr(namespace, name, None)
+        if op is None or getattr(op, "_sglang_official_opapi_guard", False):
+            continue
+        setattr(namespace, name, _guard_official_opapi_resolution(op, name))
+
+
 @_call_once
 def init_npu_backend():
     """
@@ -325,7 +399,6 @@ def init_npu_backend():
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
     try:
-        import custom_ops  # noqa: F401
         import sgl_kernel_npu  # noqa: F401
     except ImportError as e:
         logger.warning("NPU custom kernel packages unavailable: %s", e)
@@ -341,6 +414,19 @@ def init_npu_backend():
         torch.cuda.is_available = lambda: False
         torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
+    _prefer_package_common_headers()
+    _install_official_opapi_guards()
+    # The op handles are resolved lazily; drop any pre-guard resolution so the
+    # cached handles point at the guarded wrappers.
+    _mqsmla_ops.cache_clear()
+
+    if os.environ.get("MQSMLA_CAPTURE_DIR"):
+        # Debug aid: dump mqsmla/compressor/indexer op args to compare against
+        # the verified smoke call. See mqsmla_capture.py for the env knobs.
+        from sglang.srt.hardware_backend.npu import mqsmla_capture
+
+        mqsmla_capture.install()
+        _mqsmla_ops.cache_clear()
 
 
 def _is_nz_aligned(tensor: torch.Tensor) -> bool:

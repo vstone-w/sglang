@@ -12,6 +12,7 @@ def _clear_unaccepted_c128_draft_states_kernel(
     ring_size: tl.constexpr,
     half: tl.constexpr,
     num_draft_tokens: tl.constexpr,
+    bank_block_offset: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     bid = tl.program_id(0)
@@ -25,7 +26,7 @@ def _clear_unaccepted_c128_draft_states_kernel(
     req_pool_idx = tl.load(req_pool_indices + bid).to(tl.int64)
     seq_len = tl.load(seq_lens + bid).to(tl.int64)
     slot = (seq_len + draft_offset) % ring_size
-    row = req_pool_idx * ring_size + slot
+    row = (req_pool_idx + bank_block_offset) * ring_size + slot
 
     offsets = block_id * BLOCK_D + tl.arange(0, BLOCK_D)
     mask = offsets < half
@@ -42,6 +43,7 @@ def clear_unaccepted_c128_draft_states(
     *,
     ring_size: int,
     num_draft_tokens: int,
+    bank_block_offset: int = 0,
 ) -> None:
     half = state.shape[-1] // 2
     _clear_unaccepted_c128_draft_states_kernel[
@@ -54,5 +56,6 @@ def clear_unaccepted_c128_draft_states(
         ring_size,
         half,
         num_draft_tokens,
+        bank_block_offset,
         BLOCK_D=256,
     )

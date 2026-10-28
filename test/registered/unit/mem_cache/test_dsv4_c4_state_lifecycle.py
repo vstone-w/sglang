@@ -36,22 +36,36 @@ def _mark_reused(req):
     req.inflight_middle_chunks = 1
 
 
-def _c4_pool(rows: int, width: int, ring_size: int):
+def _c4_pool(rows: int, width: int, ring_size: int, bank_block_offset: int = 0):
     return SimpleNamespace(
         ratio=4,
         ring_size=ring_size,
+        bank_block_offset=bank_block_offset,
         kv_score_buffer=KVAndScore(torch.full((rows, width), 7.0)),
     )
 
 
-def _token_pool(unified: bool, ring_size: int = 8):
+def _token_pool(
+    unified: bool, ring_size: int = 8, bank_block_offset: int = 0
+):
     logical_rows = 4 * ring_size
     physical_rows = logical_rows + ring_size + 4
-    attn = _c4_pool(physical_rows, width=12, ring_size=ring_size)
-    indexer = _c4_pool(physical_rows, width=8, ring_size=ring_size)
+    attn = _c4_pool(
+        physical_rows,
+        width=12,
+        ring_size=ring_size,
+        bank_block_offset=bank_block_offset,
+    )
+    indexer = _c4_pool(
+        physical_rows,
+        width=8,
+        ring_size=ring_size,
+        bank_block_offset=bank_block_offset,
+    )
     c128 = SimpleNamespace(
         ratio=128,
         ring_size=128,
+        bank_block_offset=0,
         kv_score_buffer=KVAndScore(torch.full((physical_rows, 8), 9.0)),
     )
     token_pool = object.__new__(DeepSeekV4TokenToKVPool)
@@ -92,6 +106,30 @@ class TestUnifiedC4StateLifecycle(unittest.TestCase):
             self.assertTrue(torch.isneginf(state[selected, half:]).all())
             self.assertTrue((state[untouched] == 7).all())
             self.assertTrue((state[logical_rows:] == 7).all())
+        self.assertTrue((c128.kv_score_buffer.kv_score == 9).all())
+
+    def test_clear_shifts_the_a5_reserved_bank_block(self):
+        # cache_mode=1 writes skip state block 0, so request r's ring lives at
+        # block r+1; a free must clear that block, not the neighbour's.
+        ring_size = 8
+        token_pool, attn, indexer, c128, _ = _token_pool(
+            unified=True, ring_size=ring_size, bank_block_offset=1
+        )
+
+        token_pool.clear_c4_req_states([1, 3])
+
+        selected = torch.tensor(list(range(16, 24)) + list(range(32, 40)))
+        untouched = torch.tensor(list(range(0, 16)) + list(range(24, 32)))
+        for pool in (attn, indexer):
+            state = pool.kv_score_buffer.kv_score
+            half = state.shape[-1] // 2
+            self.assertTrue(
+                torch.equal(
+                    state[selected, :half], torch.zeros_like(state[selected, :half])
+                )
+            )
+            self.assertTrue(torch.isneginf(state[selected, half:]).all())
+            self.assertTrue((state[untouched] == 7).all())
         self.assertTrue((c128.kv_score_buffer.kv_score == 9).all())
 
     def test_clear_is_noop_off_the_unified_path(self):

@@ -119,6 +119,9 @@ def dsv4_state_payloads(
                 req_pool_idx,
                 seq_len,
                 ring_size=req_to_token_pool.get_dsv4_c4_state_ring_size(),
+                bank_block_offset=(
+                    req_to_token_pool.get_dsv4_c4_state_bank_block_offset()
+                ),
             )
 
         payloads[AscendStateType.DSV4_C4_STATE] = c4_state_indices

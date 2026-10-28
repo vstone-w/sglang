@@ -14,6 +14,10 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _is_hip = is_hip()
 
+# The CANN compressor's cache_mode=1 treats state block 0 as the "unassigned"
+# sentinel and skips writes to it, so request banks start at block 1.
+CACHE_MODE1_BANK_BLOCK_OFFSET = 1
+
 
 def _lcm(a: int, b: int) -> int:
     return a // gcd(a, b) * b
@@ -86,6 +90,7 @@ def c4_state_transfer_indices(
     seq_len: int,
     *,
     ring_size: int,
+    bank_block_offset: int = 0,
 ) -> np.ndarray:
     """PD transfer rows of the overlap C4 state: the live tail of the request's ring."""
     # Prefill and decode can have different ring sizes (8 or 16 with EAGLE/MTP);
@@ -98,7 +103,8 @@ def c4_state_transfer_indices(
     seq_len = max(0, int(seq_len))
     state_len = seq_len % 4 + 4
     positions = np.arange(max(0, seq_len - state_len), seq_len, dtype=np.int64)
-    rows = int(req_pool_idx) * int(ring_size) + positions % int(ring_size)
+    bank = int(req_pool_idx) + int(bank_block_offset)
+    rows = bank * int(ring_size) + positions % int(ring_size)
     return rows.astype(np.int32)
 
 
@@ -109,6 +115,7 @@ def request_scoped_state_transfer_indices(
     ratio: int,
     online: bool,
     ring_size: int,
+    bank_block_offset: int = 0,
 ) -> np.ndarray:
     """PD transfer indices of a request-scoped compress state: the one pending
     partial block of ``ratio`` tokens, as the request's single online row or the
@@ -116,17 +123,22 @@ def request_scoped_state_transfer_indices(
     if seq_len == 0 or seq_len % ratio == 0:
         return np.empty((0,), dtype=np.int32)
     if online:
-        return np.array([int(req_pool_idx)], dtype=np.int32)
+        return np.array([int(req_pool_idx) + int(bank_block_offset)], dtype=np.int32)
 
     assert ring_size % ratio == 0, (
         f"ring_size must be a multiple of {ratio}, got {ring_size}"
     )
     pages_per_req = ring_size // ratio
-    page = int(req_pool_idx) * pages_per_req + ((seq_len - 1) % ring_size) // ratio
+    bank = int(req_pool_idx) + int(bank_block_offset)
+    page = bank * pages_per_req + ((seq_len - 1) % ring_size) // ratio
     return np.array([page], dtype=np.int32)
 
 
 class CompressStatePool:
+    # First physical block holding request banks. A5's cache_mode=1 reserves
+    # block 0 as the unassigned sentinel; every other backend starts at 0.
+    bank_block_offset = 0
+
     def __init__(
         self,
         size: int,
@@ -196,13 +208,16 @@ class CompressStatePool:
             # Only an odd prefix leaves a pending half-pair for decode to read.
             if seq_len % 2 == 0:
                 return np.empty((0,), dtype=np.int32)
-            return np.array([int(req_pool_idx)], dtype=np.int32)
+            return np.array(
+                [int(req_pool_idx) + self.bank_block_offset], dtype=np.int32
+            )
         return request_scoped_state_transfer_indices(
             req_pool_idx,
             seq_len,
             ratio=self.ratio,
             online=self.online,
             ring_size=self.ring_size,
+            bank_block_offset=self.bank_block_offset,
         )
 
     def _alloc_kv_score_buffer(

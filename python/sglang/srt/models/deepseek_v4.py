@@ -56,10 +56,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
     prime_rope_cos_sin,
     rope_cos_sin,
 )
-from sglang.srt.hardware_backend.npu.utils import (
-    is_npu_arch35,
-    use_npu_arch35_mxfp8_wo_a,
-)
+from sglang.srt.hardware_backend.npu.utils import use_npu_arch35_mxfp8_wo_a
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -2935,16 +2932,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if _is_npu:
-            if not is_npu_arch35():
-                return torch.ops.custom.npu_hc_post(x, residual, post, comb)
-            # The A5 build of npu_hc_post is batched — it requires a leading
-            # batch axis on every operand.
-            return torch.ops.custom.npu_hc_post(
-                x.unsqueeze(0),
-                residual.unsqueeze(0),
-                post.unsqueeze(0),
-                comb.unsqueeze(0),
-            ).squeeze(0)
+            # Official TND form: y[i] = post[i] * x + sum_j comb[j, i] * residual[j].
+            import cann_ops_transformer  # noqa: F401  (registers the namespace)
+
+            return torch.ops.cann_ops_transformer.mhc_post(residual, comb, x, post)
 
         if _is_xpu:
             return _get_mhc_ops().mhc_post(x, residual, post, comb)

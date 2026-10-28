@@ -83,6 +83,12 @@ class DSV4ReqToTokenTablesMixin:
             raise RuntimeError("DSV4 allocator is not registered")
         return self._dsv4_allocator.get_kvcache().get_ring_size(4)
 
+    def get_dsv4_c4_state_bank_block_offset(self) -> int:
+        """Return the first C4 state block holding a request bank."""
+        if self._dsv4_allocator is None:
+            raise RuntimeError("DSV4 allocator is not registered")
+        return self._dsv4_allocator.get_kvcache().get_c4_state_bank_block_offset()
+
     def set_c128_prefix_pages(self, req, page_ids: torch.Tensor) -> None:
         """Install pages returned by a Radix match.
 

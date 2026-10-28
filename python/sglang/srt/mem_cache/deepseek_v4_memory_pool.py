@@ -1170,6 +1170,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             spec.speculative_num_draft_tokens or 0,
         )
 
+    def get_c4_state_bank_block_offset(self) -> int:
+        """First state block holding a request bank (A5 reserves block 0)."""
+        for pool in self.compress_state_pools:
+            if pool is not None and pool.ratio == 4:
+                return pool.bank_block_offset
+        return 0
+
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
@@ -1719,9 +1726,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         ring_size = self.get_ring_size(4)
         device = pools[0].kv_score_buffer.kv_score.device
+        bank_offset = pools[0].bank_block_offset
         req_indices = torch.as_tensor(req_pool_indices, dtype=torch.long, device=device)
         state_locs = (
-            req_indices[:, None] * ring_size
+            (req_indices + bank_offset)[:, None] * ring_size
             + torch.arange(ring_size, dtype=torch.long, device=device)
         ).flatten()
 
@@ -1752,13 +1760,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 continue
 
             if pool.ratio == 128 and ONLINE_C128:
-                row = pool.kv_score_buffer.kv_score[req_pool_idx]
+                row = pool.kv_score_buffer.kv_score[
+                    req_pool_idx + pool.bank_block_offset
+                ]
                 head_dim = row.shape[-1] // 3
                 row[:head_dim].fill_(float("-inf"))
                 row[head_dim:].zero_()
                 continue
 
-            start = req_pool_idx * pool.ring_size
+            start = (req_pool_idx + pool.bank_block_offset) * pool.ring_size
             pool.kv_score_buffer[start : start + pool.ring_size].clear()
 
     def clear_unaccepted_c128_draft_states(
@@ -1785,6 +1795,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 accept_lens,
                 ring_size=pool.ring_size,
                 num_draft_tokens=num_draft_tokens,
+                bank_block_offset=pool.bank_block_offset,
             )
 
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
