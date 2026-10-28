@@ -18,7 +18,12 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.hardware_backend.npu.utils import (
+    is_npu_arch35,
+    npu_a5_kv_quant_path,
+    require_mqsmla_ops,
+    use_npu_arch35_mqsmla_attn,
+)
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -45,6 +50,11 @@ def _sparse_attn_ops(is_dspark=False):
     flag on the pre-A5 one.
     """
     if is_npu_arch35():
+        if use_npu_arch35_mqsmla_attn():
+            # One pool per process: when mqsmla owns the 608B packed rows the
+            # draft reader must use the same dialect, not the 640B v2 ops.
+            metadata_op, attn_op, _ = require_mqsmla_ops()
+            return metadata_op, attn_op
         if is_dspark:
             return (
                 torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv_v2_metadata,
@@ -66,8 +76,16 @@ def _sparse_attn_kv_quant_kwargs() -> dict:
     """Extra kwargs the A5 kv-quant kernels need to interpret the KV layout."""
     if not is_npu_arch35():
         return {}
+    cfg = npu_a5_kv_quant_path()
+    if use_npu_arch35_mqsmla_attn():
+        # mqsmla tiles internally and requires quant_mode to equal the
+        # metadata op's; there is no tile_size attribute.
+        return {
+            "quant_mode": cfg.reader_quant_mode,
+            "rope_head_dim": _NPU_ARCH35_KV_ROPE_HEAD_DIM,
+        }
     return {
-        "kv_quant_mode": 1,
+        "kv_quant_mode": cfg.reader_quant_mode,
         "tile_size": _NPU_ARCH35_KV_TILE_SIZE,
         "rope_head_dim": _NPU_ARCH35_KV_ROPE_HEAD_DIM,
     }
@@ -86,6 +104,55 @@ def prewarm_dsv4_aicpu(attn_backend, device) -> None:
         is_nextn=False,
     )
     torch.npu.synchronize(device)
+
+
+def _sparse_attn_layout_kv() -> str:
+    """PA_BBND is the mqsmla name for the same paged (pages, page, 1, kv_d) KV."""
+    return npu_a5_kv_quant_path().reader_layout_kv
+
+
+def _seqused_kv_kwargs(
+    seqused_kv: torch.Tensor, *, cmp_ratio: int, has_cmp_kv: bool
+) -> dict:
+    """Map the shared per-batch KV length tensor to one op dialect's args.
+
+    mqsmla splits seqused per KV input and reconstructs the pre-compression
+    length as cmp_len * cmp_ratio + residual, so cmp_residual_kv is passed
+    exactly when cmp_mask_mode=3 and cmp_ratio != 1 and forbidden otherwise.
+    """
+    if not use_npu_arch35_mqsmla_attn():
+        return {"seqused_kv": seqused_kv}
+    kwargs = {"seqused_ori_kv": seqused_kv}
+    if has_cmp_kv and cmp_ratio != 1:
+        kwargs["seqused_cmp_kv"] = seqused_kv // cmp_ratio
+        kwargs["cmp_residual_kv"] = seqused_kv % cmp_ratio
+    return kwargs
+
+
+def _legacy_sparse_attn_kwargs(kwargs: dict, seqused_kv: torch.Tensor) -> dict:
+    """Kwargs for the non-quant ops the DSpark draft worker swaps in.
+
+    The draft worker overrides op selection after the shared kwargs are built,
+    so drop the quant-path extras and restore the shared seqused name and
+    layout (arch35 quant kwargs are unknown keywords to the host ops).
+    """
+    legacy = {
+        k: v
+        for k, v in kwargs.items()
+        if k
+        not in (
+            "quant_mode",
+            "kv_quant_mode",
+            "tile_size",
+            "rope_head_dim",
+            "seqused_ori_kv",
+            "seqused_cmp_kv",
+            "cmp_residual_kv",
+        )
+    }
+    legacy["seqused_kv"] = seqused_kv
+    legacy["layout_kv"] = "PA_ND"
+    return legacy
 
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
@@ -1997,16 +2064,17 @@ class DeepseekV4AscendAttnBackend(
         common = {
             **_sparse_attn_kv_quant_kwargs(),
             "cu_seqlens_q": actual_seq_lengths_q_pa,
-            "seqused_kv": actual_seq_lengths_kv,
+            **_seqused_kv_kwargs(actual_seq_lengths_kv, cmp_ratio=1, has_cmp_kv=False),
             "cmp_ratio": 1,
             "ori_mask_mode": 4,
-            "cmp_mask_mode": 3,
+            # mqsmla rejects cmp_mask_mode=3 while cmp_kv is absent (c1a).
+            "cmp_mask_mode": 0 if use_npu_arch35_mqsmla_attn() else 3,
             "ori_win_left": getattr(
                 fm, "ori_win_left", self._dsv4_sliding_window_size - 1
             ),
             "ori_win_right": getattr(fm, "ori_win_right", 0),
             "layout_q": "TND",
-            "layout_kv": "PA_ND",
+            "layout_kv": _sparse_attn_layout_kv(),
         }
         base_kwargs = {
             "batch_size": bs,
@@ -2021,16 +2089,13 @@ class DeepseekV4AscendAttnBackend(
             cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
             if cu_q_cpu is not None and cu_q_cpu.numel() > bs + 1:
                 cu_q_cpu = cu_q_cpu[: bs + 1]
-            host_inputs = {"seqused_kv": fm.seq_lens_cpu_int[:bs].int()}
+            c1a_kwargs = _legacy_sparse_attn_kwargs(
+                c1a_kwargs, fm.seq_lens_cpu_int[:bs].int()
+            )
             if cu_q_cpu is not None:
-                host_inputs["cu_seqlens_q"] = cu_q_cpu
-            c1a_kwargs = c1a_kwargs | host_inputs
+                c1a_kwargs["cu_seqlens_q"] = cu_q_cpu
             metadata_op = torch.ops.npu.sparse_attn_sharedkv_metadata_host
         else:
-            c1a_kwargs = c1a_kwargs | {
-                "cu_seqlens_q": actual_seq_lengths_q_pa,
-                "seqused_kv": actual_seq_lengths_kv,
-            }
             metadata_op, _ = _sparse_attn_ops(self._is_dspark_draft_worker)
         c1a_metadata = metadata_op(**c1a_kwargs)
         kernel_metadata = {"c1a_metadata": c1a_metadata}
@@ -2041,6 +2106,13 @@ class DeepseekV4AscendAttnBackend(
                 "has_cmp_kv": True,
                 "cmp_topk": self._dsv4_index_topk,
             }
+            if use_npu_arch35_mqsmla_attn():
+                c4a_overrides |= {
+                    "cmp_mask_mode": 3,
+                    **_seqused_kv_kwargs(
+                        actual_seq_lengths_kv, cmp_ratio=4, has_cmp_kv=True
+                    ),
+                }
             c4a_kwargs = c1a_kwargs | c4a_overrides
             metadata_op, _ = _sparse_attn_ops()
             kernel_metadata["c4a_metadata"] = metadata_op(**c4a_kwargs)
@@ -2070,6 +2142,13 @@ class DeepseekV4AscendAttnBackend(
 
         if self._dsv4_has_c128:
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
+            if use_npu_arch35_mqsmla_attn():
+                c128a_overrides |= {
+                    "cmp_mask_mode": 3,
+                    **_seqused_kv_kwargs(
+                        actual_seq_lengths_kv, cmp_ratio=128, has_cmp_kv=True
+                    ),
+                }
             c128a_kwargs = c1a_kwargs | c128a_overrides
             metadata_op, _ = _sparse_attn_ops()
             kernel_metadata["c128a_metadata"] = metadata_op(**c128a_kwargs)
@@ -2119,15 +2198,17 @@ class DeepseekV4AscendAttnBackend(
 
         attn_kwargs = dict(
             **_sparse_attn_kv_quant_kwargs(),
+            **_seqused_kv_kwargs(
+                fm.actual_seq_lengths_kv, cmp_ratio=1, has_cmp_kv=False
+            ),
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
-            seqused_kv=fm.actual_seq_lengths_kv,
             ori_mask_mode=4,
             ori_win_left=getattr(
                 fm, "ori_win_left", self._dsv4_sliding_window_size - 1
             ),
             ori_win_right=getattr(fm, "ori_win_right", 0),
             layout_q="TND",
-            layout_kv="PA_ND",
+            layout_kv=_sparse_attn_layout_kv(),
             q=q,
             ori_kv=ori_kv,
             ori_block_table=fm.swa_page_table,
@@ -2137,6 +2218,9 @@ class DeepseekV4AscendAttnBackend(
             cmp_ratio=1,
         )
         if self._is_dspark_draft_worker and not is_npu_arch35():
+            attn_kwargs = _legacy_sparse_attn_kwargs(
+                attn_kwargs, fm.actual_seq_lengths_kv
+            )
             attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
         ori_sparse_indices = getattr(fm, "ori_sparse_indices", None)
         if ori_sparse_indices is not None:
@@ -2190,13 +2274,15 @@ class DeepseekV4AscendAttnBackend(
 
         attn_kwargs = dict(
             **_sparse_attn_kv_quant_kwargs(),
+            **_seqused_kv_kwargs(
+                fm.actual_seq_lengths_kv, cmp_ratio=compress_ratio, has_cmp_kv=True
+            ),
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
-            seqused_kv=fm.actual_seq_lengths_kv,
             ori_mask_mode=4,
             ori_win_left=self._dsv4_sliding_window_size - 1,
             ori_win_right=0,
             layout_q="TND",
-            layout_kv="PA_ND",
+            layout_kv=_sparse_attn_layout_kv(),
             q=q,
             ori_kv=ori_kv,
             ori_block_table=fm.swa_page_table,

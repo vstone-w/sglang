@@ -964,6 +964,13 @@ class Envs:
     # weights at load time. False preserves the existing loading behavior.
     SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
+    # A5 (arch35) DSV4 pooled-KV path A/B switch. 1 forces the CANN 9.2
+    # mixed-quant ops (cann_ops_transformer.mixed_quant_sparse_flash_mla +
+    # kv_compress_epilog, 608B rope-first rows with bf16 group scales); 0
+    # forces the sgl_kernel_npu kv-quant ops (640B rows, e8m0 scales). Unset
+    # (default) auto-selects by probing the cann_ops_transformer ops:
+    # present -> mqsmla, absent -> sgl_kernel_npu. Ignored on pre-A5 parts.
+    SGLANG_NPU_USE_MQSMLA_ATTN = EnvBool(None)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.

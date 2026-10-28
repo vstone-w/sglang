@@ -23,7 +23,12 @@ import torch_npu
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.hardware_backend.npu.utils import (
+    is_npu_arch35,
+    npu_a5_kv_quant_path,
+    require_mqsmla_ops,
+    use_npu_arch35_mqsmla_attn,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     ONLINE_C128,
@@ -32,9 +37,6 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
 )
 from sglang.srt.runtime_context import get_schedule
-
-_NPU_ARCH35_KV_QUANT_GROUP_SIZE = 64
-_NPU_ARCH35_KV_ROW_ALIGNMENT = 128
 
 
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
@@ -53,18 +55,20 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         # Set before super().__init__ — it calls _create_buffers() ->
         # create_buffer(), which reads self.kernel_page_size.
         self.kernel_page_size = kernel_page_size
+        if is_npu_arch35():
+            # Resolve the kv-quant path at pool init so the op probe and its
+            # selection log surface before the first forward.
+            npu_a5_kv_quant_path()
         super().__init__(*args, **kwargs)
 
     @property
     def a5_packed_kv_dim(self) -> int:
+        cfg = npu_a5_kv_quant_path()
         nope_dim = self.qk_nope_head_dim
         rope_dim = self.qk_rope_head_dim
-        scale_dim = math.ceil(nope_dim / _NPU_ARCH35_KV_QUANT_GROUP_SIZE)
-        bytes_per_token = nope_dim + rope_dim * 2 + scale_dim
-        return (
-            math.ceil(bytes_per_token / _NPU_ARCH35_KV_ROW_ALIGNMENT)
-            * _NPU_ARCH35_KV_ROW_ALIGNMENT
-        )
+        scale_dim = math.ceil(nope_dim / cfg.quant_group_size)
+        bytes_per_token = nope_dim + rope_dim * 2 + scale_dim * cfg.scale_itemsize
+        return math.ceil(bytes_per_token / cfg.row_alignment) * cfg.row_alignment
 
     def create_buffer(self, *, num_pages: int):
         # Non-bf16 store dtype (shouldn't happen here) falls back to base layout.
@@ -587,11 +591,27 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         if cache_2d.shape[0] == 0:
             return
+        cfg = npu_a5_kv_quant_path()
+        if use_npu_arch35_mqsmla_attn():
+            _, _, writer_op = require_mqsmla_ops()
+            # The cann_ops_transformer writer scatters into the 4-D paged cache
+            # (blockNum, blockSize, 1, headDim) as raw bytes; rows are
+            # [rope bf16 128B][nope fp8 448B][scale 7x bf16 @576][pad -> 608B].
+            writer_op(
+                buf.view(torch.uint8),
+                cache_2d,
+                slot_mapping,
+                quant_group_size=cfg.quant_group_size,
+                quant_mode=cfg.writer_quant_mode,
+                round_scale=True,
+                x_scale=1.0,
+            )
+            return
         torch.ops.npu.kv_compress_epilog(
             buf.view(-1, 1, buf.shape[-1]),
             cache_2d,
             slot_mapping,
-            quant_group_size=_NPU_ARCH35_KV_QUANT_GROUP_SIZE,
+            quant_group_size=cfg.quant_group_size,
             quant_mode=2,
             round_scale_flag=True,
             layout=1,

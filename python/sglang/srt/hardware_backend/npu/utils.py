@@ -4,6 +4,7 @@ import sys
 from enum import IntEnum
 from typing import TYPE_CHECKING, Callable, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.arg_groups.overrides import (
@@ -54,6 +55,121 @@ def use_npu_arch35_mxfp8_wo_a(
         return False
     weight_block_size = getattr(quant_config, "weight_block_size", None)
     return tuple(weight_block_size or ()) == (128, 128)
+
+
+@functools.lru_cache(maxsize=1)
+def _mqsmla_ops() -> Optional[tuple]:
+    """Resolve the cann_ops_transformer mqsmla op trio, or None if unavailable.
+
+    Import success alone is not enough: older cann_ops_transformer builds
+    (CANN 9.1 era) lack the mqsmla ops, so the op attributes are probed too.
+    Cached — the answer cannot change within a process.
+    """
+    try:
+        import cann_ops_transformer  # noqa: F401
+
+        ops_ns = torch.ops.cann_ops_transformer
+        return (
+            ops_ns.mixed_quant_sparse_flash_mla_metadata,
+            ops_ns.mixed_quant_sparse_flash_mla,
+            ops_ns.kv_compress_epilog,
+        )
+    except (ImportError, AttributeError, RuntimeError):
+        return None
+
+
+def use_npu_arch35_mqsmla_attn() -> bool:
+    """Whether A5 DSV4 attention runs the cann_ops_transformer mixed-quant ops.
+
+    SGLANG_NPU_USE_MQSMLA_ATTN selects the path when set (1 forces mqsmla and
+    fails fast if the ops are missing; 0 forces the sgl_kernel_npu kv-quant
+    path). Unset — the default — auto-selects by op presence: CANN 9.2 images
+    ship the mqsmla ops, CANN 9.1 images do not.
+    """
+    if not is_npu_arch35():
+        return False
+    if envs.SGLANG_NPU_USE_MQSMLA_ATTN.is_set():
+        return envs.SGLANG_NPU_USE_MQSMLA_ATTN.get()
+    return _mqsmla_ops() is not None
+
+
+@functools.lru_cache(maxsize=1)
+def _log_a5_kv_quant_selection() -> None:
+    """Log the A5 pooled-KV path once — the row format differs per path."""
+    if use_npu_arch35_mqsmla_attn():
+        logger.info(
+            "A5 DSV4 kv-quant: mqsmla path (cann_ops_transformer "
+            "mixed_quant_sparse_flash_mla + kv_compress_epilog, 608B rows "
+            "with bf16 group scales)"
+        )
+    else:
+        logger.info(
+            "A5 DSV4 kv-quant: sgl_kernel_npu kv-quant path (640B rows with "
+            "e8m0 scales)"
+        )
+
+
+def require_mqsmla_ops():
+    """The mqsmla op trio; only reached after use_npu_arch35_mqsmla_attn()."""
+    ops = _mqsmla_ops()
+    if ops is None:
+        raise RuntimeError(
+            "SGLANG_NPU_USE_MQSMLA_ATTN=1 (or the A5 op-presence auto-probe) "
+            "selected the mqsmla path, but the cann_ops_transformer ops "
+            "(mixed_quant_sparse_flash_mla, mixed_quant_sparse_flash_mla_metadata, "
+            "kv_compress_epilog) cannot be resolved. Install/upgrade "
+            "cann_ops_transformer built from ops-transformer 9.2.0+, or set "
+            "SGLANG_NPU_USE_MQSMLA_ATTN=0 to force the sgl_kernel_npu "
+            "kv-quant path."
+        )
+    return ops
+
+
+class NpuA5KvQuantPath(msgspec.Struct, frozen=True):
+    """A5 pooled-KV row format and op dialect for one attention path.
+
+    Row bytes = nope + rope*2 + ceil(nope/group)*scale_itemsize, aligned up to
+    row_alignment. Field order inside the row differs per path (legacy:
+    nope|rope|e8m0 scale; mqsmla: rope|nope|bf16 scale) but the byte total
+    formula is shared. Layouts are fixed by the kernels on the other side:
+    sgl_kernel_npu kv_compress_epilog / npu_kv_quant_sparse_attn_sharedkv for
+    legacy, cann_ops_transformer kv_compress_epilog / mixed_quant_sparse_flash_mla
+    for mqsmla.
+    """
+
+    quant_group_size: int
+    scale_itemsize: int
+    row_alignment: int
+    reader_quant_mode: int
+    reader_layout_kv: str
+    writer_quant_mode: str | None
+
+
+NPU_A5_KV_QUANT_LEGACY = NpuA5KvQuantPath(
+    quant_group_size=64,
+    scale_itemsize=1,  # e8m0 byte
+    row_alignment=128,
+    reader_quant_mode=1,  # kv_quant_mode on the sgl_kernel_npu reader
+    reader_layout_kv="PA_ND",
+    writer_quant_mode=None,
+)
+NPU_A5_KV_QUANT_MQSMLA = NpuA5KvQuantPath(
+    quant_group_size=64,
+    scale_itemsize=2,  # bf16
+    row_alignment=32,
+    reader_quant_mode=1,  # quant_mode on the cann_ops_transformer reader
+    reader_layout_kv="PA_BBND",
+    writer_quant_mode="fp8_bf16",
+)
+
+
+def npu_a5_kv_quant_path() -> NpuA5KvQuantPath:
+    _log_a5_kv_quant_selection()
+    return (
+        NPU_A5_KV_QUANT_MQSMLA
+        if use_npu_arch35_mqsmla_attn()
+        else NPU_A5_KV_QUANT_LEGACY
+    )
 
 
 class NPUACLFormat(IntEnum):
