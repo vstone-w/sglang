@@ -38,6 +38,24 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
+# One Ascend cat with ~2k tensor inputs mis-tiles (CANN ops-math issue 2525,
+# fixed by MR 4424); keep every cat below that bound.
+_STAGED_CAT_MAX_INPUTS = 256
+
+
+def _cat_bounded(tensors: list[torch.Tensor]) -> torch.Tensor:
+    """``torch.cat`` a 1-D tensor list, folding it so each cat stays small."""
+    assert tensors, "_cat_bounded requires at least one tensor"
+    level = tensors
+    while len(level) > _STAGED_CAT_MAX_INPUTS:
+        folded = []
+        for start in range(0, len(level), _STAGED_CAT_MAX_INPUTS):
+            chunk = level[start : start + _STAGED_CAT_MAX_INPUTS]
+            folded.append(chunk[0] if len(chunk) == 1 else torch.cat(chunk))
+        level = folded
+    return level[0] if len(level) == 1 else torch.cat(level)
+
+
 def alloc_extend_naive(
     prefix_lens,
     seq_lens,
@@ -169,7 +187,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return (len(self.free_pages) + self.num_staged_pages) * self.page_size
 
     def get_all_free_pages(self):
-        return torch.cat((self.free_pages, *self.staged_pages))
+        if not self.staged_pages:
+            return self.free_pages
+        return _cat_bounded([self.free_pages, *self.staged_pages])
 
     def merge_and_sort_free(self):
         if not self.staged_pages:
