@@ -289,6 +289,8 @@ def test_dflash_preparation_refreshes_lengths_and_cache_slots():
     runner.is_encoder_decoder = False
     runner.buffers = SimpleNamespace(
         input_ids=torch.zeros(4, dtype=torch.int64),
+        # pp_size=1: DecodeInputBuffers.create leaves the proxy tensors unset.
+        pp_proxy_tensors=None,
         positions=torch.zeros(4, dtype=torch.int64),
         seq_lens=torch.full((4,), 99, dtype=torch.int32),
         seq_lens_cpu=torch.full((4,), 99, dtype=torch.int32),

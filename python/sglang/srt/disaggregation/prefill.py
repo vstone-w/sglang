@@ -1873,7 +1873,15 @@ class SchedulerDisaggregationPrefillMixin:
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
+            kv_args = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args
+
             def _request_state_payload():
+                # Dispatch only calls a payload for a registered type, so the
+                # component always exists; an empty PP placeholder has no
+                # pointers and sends nothing.
+                index = kv_args.state_types.index(StateType.DSV4_REQUEST_STATE)
+                if not kv_args.state_data_ptrs[index]:
+                    return None
                 kvcache = self.token_to_kv_pool_allocator.get_kvcache()
                 return kvcache.request_state_transfer_indices(
                     int(req.kv.req_pool_idx), c128_seq_len
@@ -1888,9 +1896,7 @@ class SchedulerDisaggregationPrefillMixin:
             def _request_row_payload():
                 return np.array([req.kv.req_pool_idx], dtype=np.int32)
 
-            state_types = (
-                self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
-            )
+            state_types = kv_args.state_types
             payloads = {
                 StateType.MAMBA: _mamba_payload,
                 StateType.QSA_PENDING: _qsa_pending_payload,
@@ -1925,7 +1931,7 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 )
             state_indices = state_indices_per_entry(
-                self.disagg_prefill_bootstrap_queue.kv_manager.kv_args,
+                kv_args,
                 state_types,
                 payloads,
                 _swa_payload,

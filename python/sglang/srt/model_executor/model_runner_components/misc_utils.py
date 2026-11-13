@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
+import torch
+
 from sglang.srt.arg_groups.choices import (
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
 )
@@ -99,6 +101,53 @@ def resolve_pp_proxy_residual_num_blocks(
     if block_size is None:
         return None
     return (start_layer + block_size - 1) // block_size
+
+
+def resolve_pp_proxy_hc_pre_width(*, model_config: ModelConfig) -> int:
+    """Width of the lagged mHC pre-mix a later PP stage receives."""
+    parallel = get_parallel()
+    if parallel.pp_size <= 1 or parallel.pp_rank == 0:
+        return 0
+    hf_config = model_config.hf_text_config
+    if not getattr(hf_config, "hc_pre_from_prev_sublayer", False):
+        return 0
+    return int(getattr(hf_config, "hc_mult", 0))
+
+
+def validate_pp_proxy_mhc_pre(*, pp_proxy_tensors: Any, width: int) -> None:
+    """Reject a live proxy that cannot refresh a captured ``mhc_pre`` buffer.
+
+    The graph runners copy only the keys the live proxy carries, so a missing
+    or malformed ``mhc_pre`` (or a missing ``hidden_states``) would silently
+    replay the previous batch's rows. ``None`` stays valid: a draft runner
+    keeps its own singleton PP group and never consumes the target stage's
+    proxy, and a target stage without one fails its own model-level check.
+    """
+    if pp_proxy_tensors is None or width <= 0:
+        return
+    tensors = pp_proxy_tensors.tensors
+    pre = tensors.get("mhc_pre")
+    if pre is None:
+        raise ValueError(
+            "PP proxy is missing 'mhc_pre' required by this stage; the "
+            "previous stage must send its last sublayer's pre-mix"
+        )
+    if pre.dtype != torch.float32 or pre.dim() != 2 or pre.shape[1] != width:
+        raise ValueError(
+            "PP proxy 'mhc_pre' has the wrong layout: expected fp32 [T, "
+            f"{width}], got {pre.dtype} {tuple(pre.shape)}"
+        )
+    hidden = tensors.get("hidden_states")
+    if hidden is None:
+        raise ValueError(
+            "PP proxy is missing 'hidden_states' required by this stage; the "
+            "graph replay would keep the previous batch's rows"
+        )
+    if pre.shape[0] != hidden.shape[0]:
+        raise ValueError(
+            "PP proxy 'mhc_pre' rows must match 'hidden_states': "
+            f"{pre.shape[0]} != {hidden.shape[0]}"
+        )
 
 
 @runtime_checkable

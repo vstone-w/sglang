@@ -17,7 +17,7 @@ the cycle request-bank ABI instead. There is no paged state allocator or
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch_npu
@@ -432,6 +432,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     chain, which the community base leaves as ``NotImplementedError``.
     """
 
+    # object.__new__ stubs skip __init__; an empty map means "no QSLI pool".
+    qsli_buffers: Dict[int, List[Optional[torch.Tensor]]] = {}
+
     def __init__(
         self,
         *args,
@@ -455,6 +458,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         self._npu_window_generation = npu_window_generation
         super().__init__(*args, **kwargs)
+        self._init_qsli_buffer()
 
     def _is_v41_model(self) -> bool:
         pinned = getattr(self, "_npu_window_generation", None)
@@ -489,6 +493,84 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 else NPUDSV4KVLayout.V41_BF16
             )
         return NPUDSV4KVLayout.V4_FP8 if is_npu_arch35() else NPUDSV4KVLayout.V4_BF16
+
+    def pd_kv_layout(self) -> str:
+        base = super().pd_kv_layout()
+        candidate = int(self.candidate_source_layer_id)
+        block = int(self.candidate_block_size)
+        ratios = self.compression_ratios
+        if (
+            is_npu_arch35()
+            and self._is_v41_model()
+            and block > 0
+            and 0 <= candidate < len(ratios) - 1
+            and ratios[candidate] in NPUDSV4KVLayout.COMPRESSED_RATIOS
+        ):
+            # Rank-uniform: every stage of this model publishes the marker, so a
+            # peer built without the QSLI pool fails the handshake instead of
+            # pairing the extra entry positionally.
+            return f"{base},qsli:c{candidate}:b{block}"
+        return base
+
+    def _init_qsli_buffer(self) -> None:
+        """Allocate the level-two QSLI record the candidate source publishes.
+
+        It lives beside the indexer pool (same page geometry as index K) so PD
+        registers it and graph capture sees a stable address. Only an A5 V4.1
+        stage that owns the candidate source allocates; consumer layers address
+        the same slot through ``layer_mapping``.
+        """
+        self.qsli_buffers = {}
+        if not is_npu_arch35() or not self._is_v41_model():
+            return
+        candidate = int(self.candidate_source_layer_id)
+        block = int(self.candidate_block_size)
+        ratios = self.compression_ratios
+        if block <= 0 or not (0 <= candidate < len(ratios) - 1):
+            return
+        ratio = ratios[candidate]
+        if ratio not in NPUDSV4KVLayout.COMPRESSED_RATIOS:
+            return
+        sources = list(self.sources_by_ratio.get(ratio, ()))
+        if (
+            candidate not in sources
+            or not (self._stage_start <= candidate < self._stage_end)
+        ):
+            return
+        slot = sources.index(candidate)
+        index_k = self._indexer_pool(ratio).index_k_buffer[slot]
+        pages, page_rows = int(index_k.shape[0]), int(index_k.shape[1])
+        if page_rows % block:
+            raise RuntimeError(
+                "DeepSeek-V4.1 QSLI needs candidate_block_size to divide the "
+                f"compressed page rows, got block={block} rows={page_rows}."
+            )
+        head_dim = int(index_k.shape[-1]) * 2
+        row_bytes = block * (head_dim // 2 + head_dim // 32)
+        buffers: List[Optional[torch.Tensor]] = [None] * len(sources)
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            buffers[slot] = torch.zeros(
+                pages,
+                page_rows // block,
+                1,
+                row_bytes,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+        self.qsli_buffers[ratio] = buffers
+
+    def get_qsli_buffer(self, layer_id: int) -> torch.Tensor:
+        """The QSLI record buffer this layer writes (source) or reads (consumer)."""
+        item = self.layer_mapping[layer_id]
+        buffers = self.qsli_buffers.get(item.compress_ratio)
+        if buffers is None or buffers[item.compress_layer_id] is None:
+            raise RuntimeError(
+                "DeepSeek-V4.1 QSLI has no candidate-source record for "
+                f"layer {layer_id} (ratio {item.compress_ratio}, slot "
+                f"{item.compress_layer_id}); the candidate source must be on "
+                "this stage and the pool built before attention."
+            )
+        return buffers[item.compress_layer_id]
 
     def _make_kv_pool(
         self,
@@ -730,8 +812,63 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
                 item_lens.append(buf[0].nbytes * index_pages_per_full_page)
+            # The candidate source's merged QSLI records follow its index K
+            # group: same full-page geometry, one item per full page.
+            for qsli in self.qsli_buffers.get(ratio, ()):
+                if qsli is None:
+                    continue
+                data_ptrs.append(qsli.data_ptr())
+                data_lens.append(qsli.nbytes)
+                item_lens.append(qsli[0].nbytes * index_pages_per_full_page)
 
         return data_ptrs, data_lens, item_lens
+
+    def get_main_kv_layer_ids(self) -> List[int]:
+        """Global layer id for each entry of :meth:`get_contiguous_buf_infos`.
+
+        A PP prefill stage holds disjoint ratio groups, so PD must pair these
+        entries by layer id instead of by position. The order mirrors the
+        export exactly: the C4 group (KV, index K, index scale) when the model
+        has it, then each low-ratio group (KV, index K, index scale, and the
+        candidate source's QSLI record), skipping the empty A3 index scales the
+        export skips.
+        """
+        layer_ids: List[int] = []
+
+        def extend_group(layers: List[int], buffers) -> None:
+            assert len(buffers) == len(layers), (
+                "KV buffer count does not match its layer ids: "
+                f"{len(buffers)} buffers for {len(layers)} layers"
+            )
+            layer_ids.extend(layers)
+
+        if self.c4_kv_pool is not None:
+            c4_layers = list(self.sources_by_ratio.get(4, ()))
+            indexer_pool = self._indexer_pool(4)
+            extend_group(c4_layers, self.c4_kv_pool.kv_buffer)
+            extend_group(c4_layers, indexer_pool.index_k_buffer)
+            extend_group(c4_layers, indexer_pool.index_scale_buffer)
+
+        for ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS:
+            kv_pool = self.kv_pools.get(ratio)
+            if kv_pool is None:
+                continue
+            sources = list(self.sources_by_ratio.get(ratio, ()))
+            extend_group(sources, kv_pool.kv_buffer)
+            indexer_pool = self._indexer_pool(ratio)
+            assert len(indexer_pool.index_k_buffer) == len(sources) == len(
+                indexer_pool.index_scale_buffer
+            ), "indexer buffer count does not match its source layers"
+            for buf, layer_id in zip(
+                (*indexer_pool.index_k_buffer, *indexer_pool.index_scale_buffer),
+                sources * 2,
+            ):
+                if buf.numel():
+                    layer_ids.append(layer_id)
+            for slot, qsli in enumerate(self.qsli_buffers.get(ratio, ())):
+                if qsli is not None:
+                    layer_ids.append(sources[slot])
+        return layer_ids
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """GPU-compatible ``StateType.SWA`` component containing SWA KV only.
@@ -747,6 +884,24 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             [buf.nbytes for buf in buffers],
             [buf[0].nbytes for buf in buffers],
         )
+
+    def get_swa_state_layer_ids(self) -> List[int]:
+        """Global layer id for each entry of ``get_state_buf_infos``.
+
+        Named for the SWA ring: on other pools ``get_state_layer_ids`` means
+        the Mamba state ids, and the public registration must not confuse them.
+        """
+        return list(self.swa_layer_ids())
+
+    def get_c4_state_layer_ids(self) -> List[int]:
+        """Global layer id for each entry of ``get_c4_state_buf_infos``."""
+        layer_ids: List[int] = []
+        for pools in (self.compress_state_pools, self.indexer_compress_state_pools):
+            for layer_id, pool in enumerate(pools):
+                if pool is None or pool.ratio != 4:
+                    continue
+                layer_ids.append(layer_id)
+        return layer_ids
 
     def get_c4_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """C4 compress state ring (attention + indexer).

@@ -545,6 +545,8 @@ class TestC4StateTransferLayout(unittest.TestCase):
             pool = DSV4NPUTokenToKVPool.__new__(DSV4NPUTokenToKVPool)
             swa = torch.empty((4, 128, 1, 8), dtype=torch.bfloat16)
             pool.swa_kv_pool = SimpleNamespace(kv_buffer=[swa])
+            pool.stage_layer_ids = (0,)
+            pool.compression_ratios = (4, 4)
             pool.compress_state_pools = [
                 SimpleNamespace(
                     ratio=4,
@@ -593,6 +595,14 @@ class TestC4StateTransferLayout(unittest.TestCase):
                 ["swa", "dsv4_c4_state"],
             )
             self.assertEqual(entries.regions["state1"].item_lens, (8192, 2048))
+            # The SWA component publishes only its SWA rows' ids; the C4
+            # compress state publishes its own (attention + indexer).
+            self.assertEqual(entries.regions["state0"].layer_ids, (0,))
+            self.assertEqual(entries.regions["state1"].layer_ids, (0, 0))
+            for key, region in entries.regions.items():
+                self.assertEqual(
+                    len(region.layer_ids), len(region.ptrs), f"{key} id/ptr mismatch"
+                )
 
 
 class TestC4IndexerInitialization(unittest.TestCase):
@@ -853,6 +863,7 @@ class TestSparseAttentionMetadata(unittest.TestCase):
             backend._dsv4_head_dim = 512
             backend._dsv4_has_c4 = False
             backend._dsv4_has_c128 = False
+            backend._is_dspark_draft_worker = False
 
             forward_batch = SimpleNamespace(
                 spec_info=SimpleNamespace(draft_token_num=2),

@@ -884,18 +884,34 @@ def _static_owner_region(token_to_kv_pool) -> Region:
 
     # A pool wrapping one token KV view (its other layers hold state), or one
     # whose main page rows pair by layer id, reports per-entry layer ids for the
-    # peers to pair by.
-    layer_ids = (
-        token_to_kv_pool.get_kv_layer_ids()
-        if token_to_kv_pool.layer_router.wrapped_view() is not None
-        or isinstance(token_to_kv_pool, MiniMaxM3Nvfp4KVPool)
-        else ()
-    )
+    # peers to pair by. A pool describing its own export order under
+    # get_main_kv_layer_ids takes precedence: its ratio groups are not a
+    # positional layer list.
+    get_main_layer_ids = getattr(token_to_kv_pool, "get_main_kv_layer_ids", None)
+    if get_main_layer_ids is not None:
+        layer_ids = get_main_layer_ids()
+    else:
+        layer_ids = (
+            token_to_kv_pool.get_kv_layer_ids()
+            if token_to_kv_pool.layer_router.wrapped_view() is not None
+            or isinstance(token_to_kv_pool, MiniMaxM3Nvfp4KVPool)
+            else ()
+        )
     return Region(
         ptrs=tuple(ptrs),
         lens=tuple(lens),
         item_lens=tuple(item_lens),
         layer_ids=tuple(layer_ids),
+    )
+
+
+def _model_has_request_state_outside_stage(pool) -> bool:
+    """Whether the full model has request-scoped state this PP stage lacks."""
+    stage = set(pool.stage_layer_ids)
+    return any(
+        ratio in (2, 128)
+        for layer_id, ratio in enumerate(pool.compression_ratios)
+        if layer_id not in stage
     )
 
 
@@ -1003,11 +1019,20 @@ def _static_state_entries(
                 router.view(IdSpaceKind.SLIDING_WINDOW), MHATokenToKVPool
             ):
                 swa_kv_layout = router.view(IdSpaceKind.SLIDING_WINDOW).kv_cache_layout
+            # Optional pool capability: reading it must not import the NPU
+            # backend on hosts that only have ordinary window pools.
+            get_swa_layer_ids = getattr(
+                token_to_kv_pool, "get_swa_state_layer_ids", None
+            )
+            swa_layer_ids = (
+                get_swa_layer_ids() if get_swa_layer_ids is not None else None
+            )
             add(
                 StateType.SWA,
                 data_ptrs,
                 data_lens,
                 item_lens,
+                layer_ids=swa_layer_ids,
                 kv_layout=swa_kv_layout,
                 # Read when asked, as the window's view was: not every pool
                 # with window state keeps a window pool of its own.
@@ -1050,7 +1075,18 @@ def _static_state_entries(
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
+                        layer_ids=(
+                            token_to_kv_pool.get_request_state_layer_ids()
+                            if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                            else None
+                        ),
                     )
+                elif isinstance(
+                    token_to_kv_pool, DeepSeekV4TokenToKVPool
+                ) and _model_has_request_state_outside_stage(token_to_kv_pool):
+                    # A PP stage with no request-scoped layer still registers
+                    # the empty component: the wire order is positional.
+                    add(StateType.DSV4_REQUEST_STATE, [], [], [])
         elif router.wrapped_view() is not None:
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()
@@ -1214,6 +1250,7 @@ def _static_state_entries(
                 c4_ptrs,
                 c4_lens,
                 c4_item_lens,
+                layer_ids=token_to_kv_pool.get_c4_state_layer_ids(),
             )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same
@@ -1286,11 +1323,18 @@ def _static_state_entries(
             draft_state_type = StateType.SWA
 
         if draft_ptrs:
+            # A PP prefill stage registers only the last stage's draft entries;
+            # the ids keep the PP=1 decode peer from pairing positionally.
             add(
                 draft_state_type,
                 draft_ptrs,
                 draft_lens,
                 draft_item_lens,
+                layer_ids=(
+                    draft_token_to_kv_pool.get_swa_state_layer_ids()
+                    if hasattr(draft_token_to_kv_pool, "get_swa_state_layer_ids")
+                    else None
+                ),
             )
         row_ptrs, row_lens, row_item_lens = (
             draft_token_to_kv_pool.get_swa_valid_from_buf_infos()

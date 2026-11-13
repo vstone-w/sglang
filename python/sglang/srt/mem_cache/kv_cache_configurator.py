@@ -2178,12 +2178,23 @@ class KVCacheConfigurator:
             )
 
             pool_cls = DSV4NPUTokenToKVPool
-            kv_layout_kwargs = {}
+            hf_text = self.model_config.hf_text_config
+            kv_layout_kwargs = {
+                # A5's level-two candidate index lives in the pool so PD
+                # registers it and graph capture sees a stable address. The
+                # pool ignores both for a V4 draft or a config without one.
+                "candidate_source_layer_id": int(
+                    getattr(hf_text, "candidate_source_layer_id", -1)
+                ),
+                "candidate_block_size": int(
+                    getattr(hf_text, "candidate_block_size", 0)
+                ),
+            }
             if self.is_draft_worker:
                 # Draft rows are read by the V4 sparse-attention op, so pin the
                 # pool generation instead of relying on ``compression_ratios``
                 # having been emptied to ``[0] * layers`` above.
-                kv_layout_kwargs = {"npu_window_generation": "v4"}
+                kv_layout_kwargs["npu_window_generation"] = "v4"
         else:
             pool_cls = DeepSeekV4TokenToKVPool
             kv_layout, compressed_kv_layout = select_dsv4_kv_layout()

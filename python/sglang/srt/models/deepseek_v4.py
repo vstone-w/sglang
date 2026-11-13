@@ -4168,8 +4168,10 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: Optional[AuxHiddenStatePacker],
+        prev_pre: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
-        assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
+        # The previous stage's last sublayer already produced this stage's first
+        # pre-mix; the per-stage layer loop hands it on through HcState.pre.
         hash_ids = None
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
@@ -4244,7 +4246,7 @@ class DeepseekV4Model(nn.Module):
         # its producer update explicitly before these readers below.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
-        state = mhc.HcState(hidden_states)
+        state = mhc.HcState(hidden_states, pre=prev_pre)
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
@@ -4621,6 +4623,7 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        prev_pre = None
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -4637,6 +4640,24 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = hidden_states.view(
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
+            if self.hc_pre_from_prev_sublayer:
+                # The previous stage's last sublayer produced this pre-mix;
+                # without it the first combine falls back to stream 0.
+                prev_pre = pp_proxy_tensors.tensors.get("mhc_pre")
+                if self.pp_group.world_size > 1 and prev_pre is None:
+                    raise ValueError(
+                        "mHC pre-mix hand-off across PP is missing: the "
+                        "previous stage did not send 'mhc_pre'"
+                    )
+                if prev_pre is not None and (
+                    prev_pre.dtype != torch.float32
+                    or prev_pre.shape != (hidden_states.shape[0], self.hc_mult)
+                ):
+                    raise ValueError(
+                        "mHC pre-mix has the wrong layout: expected fp32 "
+                        f"{(hidden_states.shape[0], self.hc_mult)}, got "
+                        f"{prev_pre.dtype} {tuple(prev_pre.shape)}"
+                    )
 
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -4707,6 +4728,7 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global,
                 capture_dspark,
                 dspark_aux_hidden_states,
+                prev_pre=prev_pre,
             )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
@@ -4777,7 +4799,19 @@ class DeepseekV4Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            proxy_tensors = {"hidden_states": hidden_states.flatten(1)}
+            if self.hc_pre_from_prev_sublayer:
+                # The next stage's first sublayer consumes this pre-mix; the
+                # residual stream alone does not determine it.
+                assert last_pre is not None, (
+                    "mHC pre-mix hand-off across PP requires this stage to "
+                    "produce HcState.pre"
+                )
+                assert last_pre.dtype == torch.float32, (
+                    f"mHC pre-mix must stay fp32 across PP, got {last_pre.dtype}"
+                )
+                proxy_tensors["mhc_pre"] = last_pre
+            return PPProxyTensors(proxy_tensors)
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -5068,6 +5102,25 @@ class DeepseekV4ForCausalLM(
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        # This model's draft runs only on the last stage, so every captured
+        # target layer must live there. The check belongs here: the actual
+        # draft config and the resolved stage range are both known, while the
+        # public resolver also serves drafts (e.g. Kimi K3) that relay captured
+        # states across stages.
+        stage_start = int(self.model.start_layer)
+        stage_end = int(self.model.end_layer)
+        off_stage = sorted(
+            {
+                int(layer)
+                for layer in layer_ids
+                if not stage_start <= int(layer) < stage_end
+            }
+        )
+        if off_stage:
+            raise ValueError(
+                f"Draft capture layers {off_stage} are not on this stage "
+                f"[{stage_start},{stage_end}); adjust SGLANG_PP_LAYER_PARTITION."
             )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)

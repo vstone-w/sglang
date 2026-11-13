@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, List, Optional
 
 from sglang.srt.arg_groups.engram_config import (
     EngramConfig,
@@ -21,6 +21,7 @@ from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     run_post_process_pass,
 )
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
@@ -311,6 +312,111 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
         )
 
 
+_COMPRESSED_RATIOS = (1, 2)
+
+
+def _model_layer_ratios(hf_config: Any, num_hidden_layers: int) -> List[int]:
+    """compress_ratios for the decoder layers only (nextn entries trail)."""
+    ratios = list(hf_config.compress_ratios or ())
+    if len(ratios) < num_hidden_layers:
+        ratios.extend([0] * (num_hidden_layers - len(ratios)))
+    return ratios[:num_hidden_layers]
+
+
+def _source_layers(
+    hf_config: Any, field: str, num_hidden_layers: int
+) -> List[int]:
+    return sorted(
+        int(layer)
+        for layer in (getattr(hf_config, field, None) or ())
+        if 0 <= int(layer) < num_hidden_layers
+    )
+
+
+def validate_dsv41_pp_partition(
+    hf_config: Any,
+    *,
+    pp_size: int,
+    language_model_only: bool,
+) -> None:
+    """Raise when a PP split would break DSV4.1's per-stage shared state."""
+    if pp_size <= 1:
+        return
+    num_hidden_layers = int(hf_config.num_hidden_layers)
+
+    vision_layers = int(hf_config.vision_n_layers or 0)
+    if vision_layers > 0 and not language_model_only:
+        raise ValueError(
+            "DeepSeek-V4.1 pipeline parallelism requires --language-model-only "
+            f"today: this checkpoint carries a {vision_layers}-layer vision "
+            "tower, and the vision path rejects PP at model build. Use "
+            "--language-model-only or a text-only checkpoint."
+        )
+
+    # The runtime's own split: it reads SGLANG_PP_LAYER_PARTITION and ignores
+    # it for a singleton draft group, so validation and the actual layer
+    # assignment cannot drift apart.
+    ranges = []
+    for pp_rank in range(pp_size):
+        start, end = get_pp_indices(num_hidden_layers, pp_rank, pp_size)
+        if start >= end:
+            raise ValueError(
+                "SGLANG_PP_LAYER_PARTITION gives stage "
+                f"{pp_rank} an empty or negative layer range [{start},{end}); "
+                "every stage must own at least one layer."
+            )
+        ranges.append((start, end))
+
+    ratios = _model_layer_ratios(hf_config, num_hidden_layers)
+    stage_of = [0] * num_hidden_layers
+    for pp_rank, (start, end) in enumerate(ranges):
+        for layer in range(start, end):
+            stage_of[layer] = pp_rank
+
+    def check_sources(field: str, label: str) -> None:
+        sources = set(_source_layers(hf_config, field, num_hidden_layers))
+        # One scan over the model: each ratio-1/2 consumer must find its
+        # nearest same-ratio source inside its own stage.
+        nearest = {ratio: None for ratio in _COMPRESSED_RATIOS}
+        for layer in range(num_hidden_layers):
+            ratio = ratios[layer]
+            if ratio not in nearest:
+                continue
+            if layer in sources:
+                nearest[ratio] = layer
+                continue
+            source = nearest[ratio]
+            start, end = ranges[stage_of[layer]]
+            if source is None:
+                raise ValueError(
+                    f"stage {stage_of[layer]} covers layers [{start},{end}); "
+                    f"layer {layer} (compress_ratio={ratio}) has no {label} "
+                    "layer before it."
+                )
+            if stage_of[source] != stage_of[layer]:
+                raise ValueError(
+                    f"stage {stage_of[layer]} covers layers [{start},{end}); "
+                    f"layer {layer} (compress_ratio={ratio}) reads {label} "
+                    f"layer {source}, which is outside this stage."
+                )
+
+    check_sources("kv_source_layer_ids", "kv_source")
+    check_sources("index_source_layer_ids", "index source")
+
+    candidate = int(hf_config.candidate_source_layer_id)
+    if 0 <= candidate < num_hidden_layers:
+        for pp_rank, (start, end) in enumerate(ranges):
+            if start <= candidate < end:
+                if end != num_hidden_layers:
+                    raise ValueError(
+                        f"the candidate source layer {candidate} and its "
+                        f"consumers layers {candidate + 1}.."
+                        f"{num_hidden_layers - 1} are split across stages "
+                        f"(stage {pp_rank} ends at {end})."
+                    )
+                break
+
+
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_triton,
@@ -323,6 +429,20 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+    # PP is validated on Ascend NPU only; GPU PP has not been run yet.
+    if cfg.pp_size > 1 and cfg.device != "npu":
+        raise ValueError(
+            "DeepSeek-V4.1 pipeline parallelism is currently enabled for "
+            "Ascend NPU only; GPU PP has not been validated yet."
+        )
+    if cfg.pp_size > 1:
+        # PP1 needs neither the partition nor the text config here.
+        validate_dsv41_pp_partition(
+            model_config_of(server_args).hf_text_config,
+            pp_size=cfg.pp_size,
+            language_model_only=cfg.language_model_only,
+        )
+
     if (
         cfg.dsv4_attn_backend == "trtllm"
         and cfg.cuda_graph_config.prefill.backend
@@ -387,7 +507,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             cfg.dsv4_attn_backend == "trtllm" and cfg.enable_encoder_swa_bounded_replay,
         ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
-        ("pipeline parallelism", cfg.pp_size > 1),
     )
     for feature, enabled in unsupported:
         if enabled:
@@ -464,6 +583,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 )
             ),
         ),
+        # The replay tail is stage-local and scattered only on the last rank;
+        # its graph is keyed by the global late-layer start.
+        ("pipeline parallelism", cfg.pp_size > 1),
     )
     if cfg.enable_decoder_swa_bounded_replay:
         for feature, unsupported in incompatible:

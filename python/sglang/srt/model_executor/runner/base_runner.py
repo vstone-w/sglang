@@ -46,6 +46,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.runner_utils.buffers import (
+    allocate_pp_proxy_tensors,
+)
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     autotune_dummy_run_ctx,
     maybe_flashinfer_autotune_extend,
@@ -87,6 +90,7 @@ def _allocate_decode_buffers(
     hc_hidden_size: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
+    pp_proxy_mhc_pre_width: int = 0,
     allocate_logits_buffer: bool = True,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
@@ -127,32 +131,18 @@ def _allocate_decode_buffers(
         )
 
         if parallel.pp_size > 1:
-            # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
-            is_mhc = hc_hidden_size is not None
-            hs = hc_hidden_size if is_mhc else hidden_size
-            # Sized in tokens, not requests: under speculative decoding the
-            # verify forward carries num_tokens_per_req tokens per request and
-            # _dummy_run slices these buffers to num_tokens (same as
-            # topk_indices below). Identical for plain decode where
-            # num_tokens_per_req == 1.
-            pp_proxy_tensors = {
-                "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
-            }
-            if pp_proxy_residual_num_blocks is not None:
-                # Only Kimi K3 supplies num_blocks: its attention-residual bank
-                # is token-major [T, blocks, H] and takes the residual's place.
-                pp_proxy_tensors["attn_res_bank"] = torch.zeros(
-                    (max_num_token, pp_proxy_residual_num_blocks, hidden_size),
-                    dtype=dtype,
-                )
-            elif not is_mhc:
-                pp_proxy_tensors["residual"] = torch.zeros(
-                    (max_num_token, hidden_size), dtype=dtype
-                )
-            if pp_proxy_topk_size is not None:
-                pp_proxy_tensors["topk_indices"] = torch.zeros(
-                    (max_num_token, pp_proxy_topk_size), dtype=torch.int32
-                )
+            # One definition for the proxy buffers (shape/dtype drift here is
+            # silent: replay copies slot by slot).
+            pp_proxy_tensors = allocate_pp_proxy_tensors(
+                max_num_tokens=max_num_token,
+                max_hidden_tokens=max_num_token,
+                hidden_size=hidden_size,
+                dtype=dtype,
+                hc_hidden_size=hc_hidden_size,
+                pp_proxy_topk_size=pp_proxy_topk_size,
+                pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
+                pp_proxy_mhc_pre_width=pp_proxy_mhc_pre_width,
+            )
         else:
             pp_proxy_tensors = None
 
@@ -489,6 +479,7 @@ class BaseRunner(ABC):
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
+            pp_proxy_mhc_pre_width=mr.get_pp_proxy_hc_pre_width(),
             allocate_logits_buffer=allocate_logits_buffer,
         )
 

@@ -1552,14 +1552,21 @@ class CommonKVManager(BaseKVManager):
 
         local_layout = self.dsv41_spec_layout
         if local_layout is not None or info.dsv41_spec_layout is not None:
-            if local_layout != info.dsv41_spec_layout:
-                mismatched_fields = sorted(
-                    key
-                    for key in (local_layout or {}).keys()
-                    | (info.dsv41_spec_layout or {}).keys()
-                    if (local_layout or {}).get(key)
-                    != (info.dsv41_spec_layout or {}).get(key)
-                )
+            # Under PP the prefill advertises only the rank-uniform fields;
+            # the per-rank layer/state fields legitimately differ per stage.
+            if info.pp_size > 1:
+                layout_keys = ("num_draft_tokens", "compression_ratios")
+            else:
+                layout_keys = (local_layout or {}).keys() | (
+                    info.dsv41_spec_layout or {}
+                ).keys()
+            mismatched_fields = sorted(
+                key
+                for key in layout_keys
+                if (local_layout or {}).get(key)
+                != (info.dsv41_spec_layout or {}).get(key)
+            )
+            if mismatched_fields:
                 raise RuntimeError(
                     "DeepSeek-V4.1 DSpark PD layout mismatch "
                     f"({', '.join(mismatched_fields)}): both servers must "
@@ -2171,6 +2178,23 @@ class CommonKVManager(BaseKVManager):
             )
             return src_kv_ptrs, sliced_dst
 
+        low_ratio_sources = getattr(self.kv_args, "mla_source_layer_ids", None)
+        if (
+            state_type is None
+            and low_ratio_sources
+            and c4_full == 0
+            and c128_full == 0
+        ):
+            # DSV4.1's low-ratio groups are the whole target section, with the
+            # draft band after them.
+            return src_kv_ptrs, self._slice_low_ratio_dst_for_pp(
+                src_kv_ptrs,
+                dst_kv_ptrs,
+                low_ratio_sources,
+                start_layer,
+                end_layer,
+            )
+
         # SWA may omit nextn entries present in mla_ratios; use its buffer count.
         # C128 state ships separately as DSV4_REQUEST_STATE.
         swa_L = len(dst_kv_ptrs) - 2 * c4_full
@@ -2204,6 +2228,59 @@ class CommonKVManager(BaseKVManager):
         )
 
         return src_kv_ptrs, sliced_dst
+
+    def _slice_low_ratio_dst_for_pp(
+        self,
+        src_kv_ptrs: List[int],
+        dst_kv_ptrs: List[int],
+        low_ratio_sources: Dict[int, List[int]],
+        start_layer: int,
+        end_layer: int,
+    ) -> List[int]:
+        """Decode-side slice for DSV4.1's ratio-1/2 source groups under PP."""
+        # Wire order is [ratio 1][ratio 2], each [KV][index K][(index scale)]
+        # per source in ascending layer order; the draft band follows the target.
+        num_draft = self.kv_args.num_draft_entries
+        stage_sources = sum(
+            1
+            for layers in low_ratio_sources.values()
+            for layer in layers
+            if start_layer <= layer < end_layer
+        )
+        src_target = len(src_kv_ptrs) - num_draft
+        if stage_sources == 0:
+            if src_target:
+                raise ValueError(
+                    "DSV4.1 low-ratio PP stage has KV entries but no source "
+                    f"layers in [{start_layer}, {end_layer})"
+                )
+            return list(dst_kv_ptrs[-num_draft:]) if num_draft else []
+        if src_target % stage_sources:
+            raise ValueError(
+                "DSV4.1 low-ratio KV entries do not divide over this stage's "
+                f"{stage_sources} source layers: {src_target} entries"
+            )
+        kinds = src_target // stage_sources
+        section = kinds * sum(len(layers) for layers in low_ratio_sources.values())
+        if len(dst_kv_ptrs) - num_draft != section:
+            raise ValueError(
+                "PD peers disagree on the DSV4.1 low-ratio KV layout: prefill "
+                f"expects {section} target entries, decode registered "
+                f"{len(dst_kv_ptrs) - num_draft}"
+            )
+        sliced_dst: List[int] = []
+        base = 0
+        for ratio in (1, 2):
+            layers = low_ratio_sources.get(ratio) or []
+            first = sum(1 for layer in layers if layer < start_layer)
+            stop = sum(1 for layer in layers if layer < end_layer)
+            for kind in range(kinds):
+                group = base + kind * len(layers)
+                sliced_dst.extend(dst_kv_ptrs[group + first : group + stop])
+            base += kinds * len(layers)
+        if num_draft:
+            sliced_dst.extend(dst_kv_ptrs[-num_draft:])
+        return sliced_dst
 
     def _start_heartbeat_checker_thread(self) -> threading.Thread:
         """Start the heartbeat checker thread for Decode worker.

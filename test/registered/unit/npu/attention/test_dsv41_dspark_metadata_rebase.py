@@ -55,7 +55,7 @@ def build_backend():
     pool_module = ModuleType("sglang.srt.mem_cache.deepseek_v4_memory_pool")
     pool_module.DSV41_INDEX_PAGE_SIZE = 64
 
-    def make(arch35, width, *, draft=False, bs=3):
+    def make(arch35, width, *, draft=False, bs=3, ratios=None, v41=None):
         source = ast.parse(BACKEND.read_text())
         low_ratio = next(
             node
@@ -78,6 +78,7 @@ def build_backend():
             "_refresh_graph_verify_rows",
             "_refresh_graph_kernel_metadata",
             "_kernel_metadata_from_parts",
+            "_build_li_quant_metadata",
             "_dsv41_a3_draft_attention_kwargs",
             "_dsv41_a3_draft_kernel_metadata",
             "_forward_swa",
@@ -119,6 +120,11 @@ def build_backend():
             ),
             npu_indexer_ops=SimpleNamespace(
                 get_quant_lightning_indexer_metadata_size=lambda: 1024,
+                quant_lightning_indexer_metadata=Mock(
+                    side_effect=lambda *a, **kw: torch.full(
+                        (1024,), 13, dtype=torch.int32
+                    )
+                ),
             ),
             _dsv41_a3_ops=lambda: op,
             _ds41_ops=lambda: a5,
@@ -126,6 +132,18 @@ def build_backend():
             _sparse_attn_kv_quant_kwargs=lambda: {"kv_quant_mode": 1} if arch35 else {},
             _loc_pad_value=lambda: -1,
             _dspark_sparse_width=lambda swa, block: -(-(swa + block) // 128) * 128,
+            _seqused_kv_kwargs=lambda seqused_kv, *, cmp_ratio, has_cmp_kv: (
+                {"seqused_ori_kv": seqused_kv}
+                if not (has_cmp_kv and cmp_ratio != 1)
+                else {
+                    "seqused_ori_kv": seqused_kv,
+                    "seqused_cmp_kv": seqused_kv // cmp_ratio,
+                    "cmp_residual_kv": seqused_kv % cmp_ratio,
+                }
+            ),
+            _seqused_q_kwargs=lambda cu: (
+                {} if cu is None else {"seqused_q": (cu[1:] - cu[:-1]).to(torch.int32)}
+            ),
         )
         module = ast.Module(
             body=[
@@ -143,10 +161,22 @@ def build_backend():
         backend.page_size = 128
         backend.is_hybrid_swa = False
         backend.is_draft_worker = draft
-        backend._dsv4_has_low_ratio = not draft
-        backend._dsv4_has_c4 = backend._dsv4_has_c128 = False
-        backend._dsv4_compress_ratios = () if draft else (0, 1, 2)
-        backend._dsv4_unique_compress_ratios = backend._dsv4_compress_ratios
+        backend.needs_cpu_seq_lens = False
+        if ratios is None:
+            ratios = () if draft else (0, 1, 2)
+        if v41 is None:
+            # The draft suites model a V4.1 target; the C4/C128 stage suites
+            # default to V4 unless they ask for a V4.1 generation explicitly.
+            v41 = True if draft else any(r in (1, 2) for r in ratios)
+        # Model generation is decided by the whole model; a stage's ratios only
+        # scope which pools and dispatch tables it owns.
+        backend._dsv4_is_v41_model = v41
+        backend._dsv4_has_low_ratio = v41 and not draft
+        backend._dsv4_has_c4 = 4 in ratios
+        backend._dsv4_has_c128 = 128 in ratios
+        backend._dsv4_compress_ratios = ratios
+        backend._dsv4_unique_compress_ratios = list(dict.fromkeys(ratios))
+        backend._dsv4_stage_layer_ids = frozenset(range(len(ratios)))
         backend._dsv4_q_head_num = 64 if arch35 else 8
         backend._dsv4_kv_head_num = 1
         backend._dsv4_head_dim = 512
@@ -157,9 +187,10 @@ def build_backend():
         backend._dsv4_sliding_window_size = 128
         backend._dsv4_graph_tokens_per_req = width
         backend._is_dspark_algorithm = True
+        backend._is_eagle_algorithm = False
+        backend.needs_cpu_seq_lens = False
         backend._is_dspark_draft_worker = draft
-        backend._dsv4_is_v41_model = True
-        backend._is_dsv41_a3_dspark_draft = draft and not arch35
+        backend._is_dsv41_a3_dspark_draft = draft and v41 and not arch35
         backend._dsv4_state_pools_by_ratio = {}
         backend._SEQ_LENS_CPU_BUF_ROWS = 512
         backend._dspark_ragged_verify_layout = lambda _: None
@@ -218,9 +249,12 @@ def _capture(backend, batch):
 def _refresh(backend, batch):
     ctx = backend._build_dsv4_graph_replay_ctx(batch)
     backend._refresh_graph_seq_metadata(ctx)
-    backend._refresh_graph_verify_rows(ctx)
-    if not ctx.is_idle_replay:
-        backend._refresh_graph_dsv41_index_page_tables(ctx.fm)
+    if backend._dsv4_has_low_ratio:
+        # V4.1's verify rows are metadata-only; V4's verify refresh has its own
+        # suite. The C4/C128 cases here cover capture and dispatch refresh.
+        backend._refresh_graph_verify_rows(ctx)
+        if not ctx.is_idle_replay:
+            backend._refresh_graph_dsv41_index_page_tables(ctx.fm)
     backend._refresh_graph_kernel_metadata(ctx)
     return ctx
 
@@ -333,6 +367,60 @@ def test_a3_draft_capture_initializes_own_metadata_and_replay_keeps_addresses(
         assert operator.call_args.kwargs["metadata"].data_ptr() == pointer
     assert b.test_ops.a3.attention.call_args.kwargs["ori_mask_mode"] == 0
     b.test_ops.host.assert_not_called()
+
+
+def test_ratio0_only_stage_captures_win_metadata_only(build_backend):
+    # A V4.1 model's all-ratio-0 PP stage still runs the V4.1 window operator:
+    # the model-wide generation decides the operator family, the stage's ratio
+    # set only decides which compressed tables exist.
+    b = build_backend(False, 5, bs=2, ratios=(0, 0), v41=True)
+    fm = _capture(b, _batch([128, 129], 5))
+    assert set(fm.kernel_metadata) == {"win_metadata"}
+    for name in ("c4_page_table", "c128_page_table", "c4_topk_indices"):
+        assert not hasattr(fm, name)
+    # Replay and idle replay keep the captured buffers in place.
+    pointer = fm.kernel_metadata["win_metadata"].data_ptr()
+    for idle in (False, True):
+        _refresh(b, _batch([130, 131], 5, idle=idle))
+        assert fm.kernel_metadata["win_metadata"].data_ptr() == pointer
+
+
+def test_c4_only_stage_captures_c4_metadata(build_backend):
+    b = build_backend(False, 5, bs=2, ratios=(0, 4))
+    fm = _capture(b, _batch([128, 129], 5))
+    assert set(fm.kernel_metadata) == {
+        "c1a_metadata",
+        "c4a_metadata",
+        "li_quant_metadata",
+    }
+    assert hasattr(fm, "c4_page_table")
+    assert hasattr(fm, "positions_cmp_padding_c4")
+    assert not hasattr(fm, "c128_page_table")
+    assert not hasattr(fm, "positions_cmp_padding_c128")
+    # Replay and idle replay refresh/clear in place: the captured graph keeps
+    # its address for both the page table and the dispatch table.
+    table = fm.c4_page_table.data_ptr()
+    dispatch = fm.kernel_metadata["c4a_metadata"].data_ptr()
+    for idle in (False, True):
+        _refresh(b, _batch([130, 131], 5, idle=idle))
+        assert fm.c4_page_table.data_ptr() == table
+        assert fm.kernel_metadata["c4a_metadata"].data_ptr() == dispatch
+
+
+def test_c128_only_stage_captures_c128_metadata(build_backend):
+    b = build_backend(False, 5, bs=2, ratios=(0, 128))
+    fm = _capture(b, _batch([128, 129], 5))
+    assert set(fm.kernel_metadata) == {"c1a_metadata", "c128a_metadata"}
+    assert hasattr(fm, "c128_page_table")
+    assert hasattr(fm, "positions_cmp_padding_c128")
+    assert not hasattr(fm, "c4_page_table")
+    assert not hasattr(fm, "positions_cmp_padding_c4")
+    table = fm.c128_page_table.data_ptr()
+    dispatch = fm.kernel_metadata["c128a_metadata"].data_ptr()
+    for idle in (False, True):
+        _refresh(b, _batch([130, 131], 5, idle=idle))
+        assert fm.c128_page_table.data_ptr() == table
+        assert fm.kernel_metadata["c128a_metadata"].data_ptr() == dispatch
 
 
 def test_a5_draft_capture_uses_the_a5_dispatch_table_only(build_backend):

@@ -400,7 +400,9 @@ class TestA3Budget(unittest.TestCase):
         self.assertEqual(budget._get_paged_kv_bytes_per_token(1), 584)
         self.assertEqual(budget._get_low_ratio_kv_padding_bytes(128), 0)
 
-    def _resolve_draft_budget(self, budget, *, dspark=True, stages=3, cap=512):
+    def _resolve_draft_budget(
+        self, budget, *, dspark=True, stages=3, cap=512, last_rank=True
+    ):
         # Execute the production constructor's sizing block with an already
         # resolved layout, without importing NPU/distributed runtime modules.
         cls = next(
@@ -436,7 +438,11 @@ class TestA3Budget(unittest.TestCase):
             ),
         )
         module = ast.Module(body=init.body[start:end], type_ignores=[])
-        exec(compile(module, str(BUDGET_FILE), "exec"), {"self": budget, "kvc": kvc})  # noqa: S102
+        parallel = SimpleNamespace(pp_group=SimpleNamespace(is_last_rank=last_rank))
+        exec(  # noqa: S102
+            compile(module, str(BUDGET_FILE), "exec"),
+            {"self": budget, "kvc": kvc, "get_parallel": lambda: parallel},
+        )
 
     def test_a3_dspark_reserves_all_draft_swa_layers_only(self):
         for stages in (1, 3, 5):
@@ -465,6 +471,14 @@ class TestA3Budget(unittest.TestCase):
     def test_a3_dspark_requires_draft_layer_count(self):
         with self.assertRaisesRegex(AssertionError, "draft layer count"):
             self._resolve_draft_budget(self._budget(), stages=0)
+
+    def test_a3_dspark_draft_budget_only_on_last_stage(self):
+        # Only the last PP stage hosts the DSpark worker; earlier stages must
+        # not reserve the draft's SWA rows.
+        budget = self._budget()
+        self._resolve_draft_budget(budget, stages=3, last_rank=False)
+        self.assertEqual(budget._npu_dspark_draft_layers, 0)
+        self.assertEqual(budget.bytes_per_swa_token, 40 * 1024)
 
     def test_other_speculative_budgets_keep_existing_inflation(self):
         for a3, dspark in ((False, True), (False, False), (True, False)):

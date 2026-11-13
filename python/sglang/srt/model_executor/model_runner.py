@@ -923,6 +923,11 @@ class ModelRunner:
             start_layer=self.layer_info.start_layer,
         )
 
+    def get_pp_proxy_hc_pre_width(self) -> int:
+        return misc_utils.resolve_pp_proxy_hc_pre_width(
+            model_config=self.model_config,
+        )
+
     def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:
@@ -2095,6 +2100,12 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors],
     ) -> ModelRunnerOutput:
+        # The graph runners refresh only the keys the live proxy carries; a
+        # missing mhc_pre would replay the previous batch's rows.
+        misc_utils.validate_pp_proxy_mhc_pre(
+            pp_proxy_tensors=pp_proxy_tensors,
+            width=self.get_pp_proxy_hc_pre_width(),
+        )
         prepare = getattr(self.model, "prepare_for_forward", None)
         if prepare is not None:
             prepare(forward_batch)

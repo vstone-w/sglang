@@ -215,6 +215,14 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         runner = self._decode_runner
         if runner is None or forward_batch.needs_forward_metadata_init():
             return False
+        if (
+            runner.buffers.pp_proxy_tensors is not None
+            and "mhc_pre" in runner.buffers.pp_proxy_tensors
+        ):
+            # Only the stages that consume a lagged mHC pre-mix need the
+            # generic load_batch path; the pre-planned fast path skips its PP
+            # preparation. First-stage decode buffers carry no mhc_pre.
+            return False
         if not runner.model_runner.spec_algorithm.is_dflash():
             # Preserve the NPU pre-planned path without refreshing metadata
             # or running the common load_batch preparation.

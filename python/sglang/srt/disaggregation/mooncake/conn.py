@@ -894,6 +894,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # The MHA branch splits the entries into K/V and is not covered.
             return None
         if has_layer_ids:
+            # Layer ids pair entries exactly, so the peer's item lengths must
+            # cover every entry it registered; a short list would leave the
+            # extra entries unvalidated behind an equal-looking fast path.
+            if len(item_lens) != len(src_data_ptrs) or len(dst_item_lens) != len(
+                dst_data_ptrs
+            ):
+                return (
+                    f"{label} item lengths do not cover every registered entry: "
+                    f"prefill {len(item_lens)}/{len(src_data_ptrs)}, decode "
+                    f"{len(dst_item_lens)}/{len(dst_data_ptrs)}"
+                )
             pairs = build_transfer_entry_pairs(
                 src_layer_ids or [],
                 dst_layer_ids or [],
@@ -1009,6 +1020,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         Checked for MLA pools, pools that publish KV layer ids, and plain MHA
         pools at the same attn TP size; not for TP-sliced MHA.
         """
+        # DSV4.1 PP slices the peer's low-ratio entries positionally, so the
+        # decode peer must publish per-entry strides: without them nothing
+        # checks that each destination entry has the source's page size.
+        ds41_pp = self.pp_size > 1 and any(
+            ratio in (1, 2)
+            for ratio in (getattr(self.kv_args, "mla_compression_ratios", None) or ())
+        )
+        if ds41_pp and self.kv_args.kv_item_lens and not info.dst_kv_item_lens:
+            return (
+                "DeepSeek-V4.1 PP decode peer published no per-entry KV item "
+                "lengths; the positional low-ratio transfer cannot be validated"
+            )
         if (
             not self.kv_args.kv_item_lens
             or not info.dst_kv_item_lens
@@ -1043,6 +1066,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             else:
                 mismatch = self._mha_kv_stride_mismatch(info)
         except Exception as e:
+            if ds41_pp:
+                # Pairing failures must reject the peer: a positional transfer
+                # that cannot be validated could write the wrong layer.
+                return f"DeepSeek-V4.1 PP KV layout could not be paired: {e}"
             # Same policy as the state check: never kill the bootstrap thread.
             logger.warning(
                 "Could not pre-check the KV layout for session %s: %s",
@@ -1163,6 +1190,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         for i, st in enumerate(state_types):
             if not self._is_generic_kvcache_state_type(st):
                 # Mamba, DSA tail and MiniMax send paths check their own layout.
+                continue
+            if not self.kv_args.state_data_ptrs[i]:
+                # A PP stage's empty placeholder for a full-model component
+                # moves no bytes, so there is no layout to match.
                 continue
             dst_data_ptrs = (
                 registration_info.dst_state_data_ptrs[i]

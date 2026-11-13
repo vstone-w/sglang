@@ -306,9 +306,16 @@ class AscendKVManager(MooncakeKVManager):
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
         # Hybrid MLA prefill stages expose PP-local entries, while a PP=1
-        # decode peer registers all model layers. Pair only this layout by
-        # global layer id; every other Ascend layout keeps the legacy path.
-        if self.is_hybrid_mla_backend and self.pp_size > 1:
+        # decode peer registers all model layers. A DSV4.1 pool that publishes
+        # main-KV layer ids pairs by id on registration and on the send; every
+        # other Ascend layout keeps the legacy path.
+        low_ratio_layer_ids = bool(
+            getattr(self.kv_args, "kv_layer_ids", None)
+        ) and any(
+            ratio in (1, 2)
+            for ratio in (getattr(self.kv_args, "mla_compression_ratios", None) or ())
+        )
+        if (self.is_hybrid_mla_backend and self.pp_size > 1) or low_ratio_layer_ids:
             return self._send_kvcache_generic(
                 mooncake_session_id=mooncake_session_id,
                 src_data_ptrs=self.kv_args.kv_data_ptrs,

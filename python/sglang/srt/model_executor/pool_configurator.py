@@ -70,6 +70,11 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 
 
+# A stage with no token-scaled KV cannot bound the PP token capacity; report a
+# sentinel that the PP MIN reduce ignores rather than capping the pipeline.
+_NO_LOCAL_TOKEN_LIMIT = 1 << 62
+
+
 def spec_decode_alloc_len_per_request(
     *,
     page_size,
@@ -1232,18 +1237,24 @@ class _DSV4PoolSizes:
 
 
 class DSV4PoolConfigurator(MemoryPoolConfigurator):
-    """DSV4 compressed attention budgets, including speculative draft storage.
-
-    The bias covers request-scoped pools that do not scale with full tokens.
-    """
+    """DSV4 compressed attention budgets, including speculative draft storage."""
 
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
+    _npu_arch35 = False
+    # DeepSeek-V4.1 rows on A3 (arch22) / A5 (arch35): the pricing below reads
+    # these to pick the pool's physical row width.
     _npu_low_ratio_bf16 = False
+    _npu_low_ratio_fp8 = False
     # A subclass that adds the draft's KV to the per-token bytes itself sets this,
     # replacing the (T+D)/T inflation.
     _draft_kv_priced_exactly = False
     _npu_dspark_draft_layers = 0
+    # The draft pins the V4 window row, which differs from the target's on A5.
+    _npu_dspark_draft_row_bytes = 0
+    # A5's QSLI record: set only on the stage that owns the candidate source.
+    _qsli_owner_ratio: Optional[int] = None
+    _qsli_entry_bytes = 0
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
@@ -1255,9 +1266,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if _is_npu:
             from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
-            self._npu_low_ratio_bf16 = not is_npu_arch35() and any(
-                ratio in (1, 2) for ratio in cfg.compress_ratios
-            )
+            has_low_ratio = any(ratio in (1, 2) for ratio in cfg.compress_ratios)
+            self._npu_arch35 = is_npu_arch35()
+            if self._npu_arch35:
+                self._npu_low_ratio_fp8 = has_low_ratio
+            else:
+                self._npu_low_ratio_bf16 = has_low_ratio
         from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
@@ -1353,6 +1367,26 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self._npu_low_ratio_bf16:
             # Matches DSV41NPUIndexerPool: BF16 K only, no packed copy/scales.
             self.low_ratio_index_bytes = self.indexer_head_dim * torch.bfloat16.itemsize
+
+        # A5's QSLI record is a second index-K-sized buffer owned by the
+        # candidate source layer; only the stage that materializes it pays.
+        self._qsli_owner_ratio: Optional[int] = None
+        self._qsli_entry_bytes = 0
+        if self._npu_arch35:
+            hf_text = cfg.hf_text_config
+            candidate = int(getattr(hf_text, "candidate_source_layer_id", -1))
+            block = int(getattr(hf_text, "candidate_block_size", 0))
+            model_ratios = list(cfg.compress_ratios)
+            if (
+                block > 0
+                and 0 <= candidate < len(model_ratios) - 1
+                and model_ratios[candidate] in (1, 2)
+                and stage.start <= candidate < stage.stop
+            ):
+                self._qsli_owner_ratio = model_ratios[candidate]
+                self._qsli_entry_bytes = self.indexer_head_dim // 2 + ceil_div(
+                    self.indexer_head_dim, 32
+                )
 
         # kvc.sliding_window_size is None on a runner without SWA layers.
         self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)
@@ -1464,20 +1498,24 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             else self._resolve_swa_cap_tokens()
         )
         if (
-            self._npu_low_ratio_bf16
+            (self._npu_low_ratio_bf16 or self._npu_low_ratio_fp8)
             and kvc.spec_algorithm.is_dspark()
             and not self.encoder_replay
         ):
-            # A3 DSpark allocates a BF16 paged SWA pool for every draft stage,
-            # but no compressed KV/indexer pools. Reserve that exact footprint.
-            aux = kvc.spec_aux_config
-            self._npu_dspark_draft_layers = int(
-                aux.dspark_num_stages or aux.dflash_draft_num_layers or 0
-            )
-            assert self._npu_dspark_draft_layers > 0, (
-                "DSpark draft layer count is required"
-            )
+            # An NPU DSpark draft allocates a paged SWA pool (the V4 window
+            # row), but no compressed KV/indexer pools. Only the last PP stage
+            # hosts the draft worker, so earlier stages must not reserve its
+            # footprint.
             self._draft_kv_priced_exactly = True
+            if get_parallel().pp_group.is_last_rank:
+                aux = kvc.spec_aux_config
+                self._npu_dspark_draft_layers = int(
+                    aux.dspark_num_stages or aux.dflash_draft_num_layers or 0
+                )
+                assert self._npu_dspark_draft_layers > 0, (
+                    "DSpark draft layer count is required"
+                )
+                self._npu_dspark_draft_row_bytes = self._npu_draft_window_row_bytes()
         self.bytes_per_swa_token = self._get_bytes_per_swa_token()
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if (
@@ -1593,6 +1631,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
             if self._npu_low_ratio_bf16 and compress_ratio in (0, 1, 2):
                 return self.attn_head_dim * torch.bfloat16.itemsize
+            if self._npu_low_ratio_fp8 and compress_ratio in (0, 1, 2):
+                # A5 rows from NPUDSV4KVLayout: the FP8 window/main stores the
+                # head plus one bf16 scale per 32 values, and a compressed row
+                # packs two e2m1 per byte plus one bf16 scale per 16 values.
+                if compress_ratio == 0:
+                    return self.attn_head_dim + 2 * ceil_div(self.attn_head_dim, 32)
+                return self.attn_head_dim // 2 + 2 * ceil_div(self.attn_head_dim, 16)
             return self.kv_bytes
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             resolve_compressed_kv_layout,
@@ -1612,6 +1657,23 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def num_swa_layers(self) -> int:
         return self.num_layers_total
 
+    def _npu_draft_window_row_bytes(self) -> int:
+        """Bytes one window row of the NPU DSpark draft pool costs.
+
+        The draft pins the V4 generation (``npu_window_generation="v4"``) even
+        when the target is V4.1: BF16 rows on A3 and the runtime quant path's
+        FP8 row on A5, so it can differ from the target's SWA row.
+        """
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
+            NPUDSV4KVLayout,
+        )
+
+        layout = (
+            NPUDSV4KVLayout.V4_FP8 if self._npu_arch35 else NPUDSV4KVLayout.V4_BF16
+        )
+        dim, dtype = layout.kv_info(self.qk_nope_head_dim, self.qk_rope_head_dim)
+        return dim * dtype.itemsize
+
     def _get_bytes_per_swa_token(self) -> float:
         """Bytes one SWA slot costs across the stage. c4_state_pool_size = swa_tokens
         // page_size * ring, so c4 compress state is priced per SWA slot too."""
@@ -1624,8 +1686,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.ring_sizes.get(4, 0) / self.page_size
-        return self._get_paged_kv_bytes_per_token() * (
-            self.num_swa_layers + self._npu_dspark_draft_layers
+        return (
+            self._get_paged_kv_bytes_per_token() * self.num_swa_layers
+            + self._npu_dspark_draft_row_bytes * self._npu_dspark_draft_layers
         ) + (
             c4_state_ratio
             * (c4_state_bytes + c4_indexer_state_bytes)
@@ -1651,19 +1714,24 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_low_ratio_kv_padding_bytes(self, full_tokens: int) -> float:
         """Reserved main/indexer pages beyond the token-scaled low-ratio bytes."""
         if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
-            if self._npu_low_ratio_bf16:
+            if self._npu_low_ratio_bf16 or self._npu_low_ratio_fp8:
                 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
                     DSV41_INDEX_PAGE_SIZE,
                 )
 
-                # A3 physical NPU pools reserve one page beyond their `size`.
+                # NPU physical pools reserve one page beyond their `size`.
                 # Indexer size already includes the reserved FULL logical page.
                 # Include SWA's reserved page here as well (not in the token
                 # coefficient, regardless of whether SWA uses cap or ratio sizing).
+                # The draft keeps the V4 window row, which differs from the
+                # target's on A5, so its pages are priced on their own row.
                 padding = (
                     self.page_size
                     * self._get_paged_kv_bytes_per_token()
-                    * (self.num_layers_total + self._npu_dspark_draft_layers)
+                    * self.num_layers_total
+                    + self.page_size
+                    * self._npu_dspark_draft_row_bytes
+                    * self._npu_dspark_draft_layers
                 )
                 for ratio in (1, 2):
                     page = self.page_size // ratio
@@ -1676,6 +1744,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                         + (index_slots - full_tokens // ratio)
                         * self.low_ratio_index_bytes
                     )
+                if self._qsli_owner_ratio is not None:
+                    # The candidate source's QSLI record is a second index-K
+                    # buffer with the same physical page count.
+                    ratio = self._qsli_owner_ratio
+                    size = (full_tokens + self.page_size) // ratio
+                    index_slots = (
+                        (size + DSV41_INDEX_PAGE_SIZE + 1) // DSV41_INDEX_PAGE_SIZE
+                    ) * DSV41_INDEX_PAGE_SIZE
+                    padding += (
+                        index_slots - full_tokens // ratio
+                    ) * self._qsli_entry_bytes
                 return padding
             return 0
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -1711,10 +1790,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         swa_ratio = (
             0 if self._unified or self.swa_cap_tokens is not None else self.swa_ratio
         )
-        return swa_ratio * self.bytes_per_swa_token + sum(
+        total = swa_ratio * self.bytes_per_swa_token + sum(
             self._compressed_bytes_per_full_token(ratio) * len(layers)
             for ratio, layers in self.stage_owner_layers.items()
         )
+        if self._qsli_owner_ratio is not None:
+            # The QSLI record duplicates one index-K payload per compressed
+            # token for the candidate source's ratio.
+            total += self._qsli_entry_bytes / self._qsli_owner_ratio
+        return total
 
     def _get_swa_fixed_bytes(self) -> float:
         """Bias bytes of the encoder-replay request window plus the cap-mode pool."""
@@ -1936,16 +2020,37 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             + c4_state_fixed_bytes
         )
         available_bytes_for_tokens = max(available_bytes - fixed_bytes, 0)
-        full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
-        full_token = full_token // page_size * page_size
-        # The coefficient excludes reserved pages. Remove the few full pages
-        # needed to cover them, including indexer rounding at this capacity.
-        while full_token > 0 and (
-            full_token * self.bytes_per_full_token
-            + self._get_low_ratio_kv_padding_bytes(full_token)
-            > available_bytes_for_tokens
-        ):
-            full_token -= page_size
+        if self.bytes_per_full_token > 0:
+            full_token = int(
+                available_bytes_for_tokens / self.bytes_per_full_token
+            )
+            full_token = full_token // page_size * page_size
+            # The coefficient excludes reserved pages. Remove the few full
+            # pages needed to cover them, including indexer rounding.
+            while full_token > 0 and (
+                full_token * self.bytes_per_full_token
+                + self._get_low_ratio_kv_padding_bytes(full_token)
+                > available_bytes_for_tokens
+            ):
+                full_token -= page_size
+        else:
+            # An all-ratio-0 stage keeps only fixed pools, so the local budget
+            # cannot bound tokens; check them, then report the sentinel. NPU SWA
+            # reserves one physical page per layer beyond `size`, which the
+            # ratio terms of the padding helper contribute nothing to here.
+            reserved_bytes = self._get_low_ratio_kv_padding_bytes(0)
+            required_bytes = fixed_bytes + reserved_bytes
+            if required_bytes > available_bytes:
+                raise RuntimeError(
+                    f"The DSV4 fixed pools ({required_bytes / (1 << 30):.2f} GB, "
+                    f"including {reserved_bytes / (1 << 30):.2f} GB of reserved "
+                    f"pages) exceed the available "
+                    f"{available_bytes / (1 << 30):.2f} GB on this stage. "
+                    "Reduce --max-running-requests or increase "
+                    "--mem-fraction-static."
+                )
+            full_token = get_schedule().max_total_tokens or _NO_LOCAL_TOKEN_LIMIT
+            full_token = full_token // page_size * page_size
         if full_token <= 0 and self.swa_cap_tokens is not None:
             raise RuntimeError(
                 f"The DSV4 SWA pool cap ({self.swa_cap_tokens} tokens, "

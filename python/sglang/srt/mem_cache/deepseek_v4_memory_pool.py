@@ -1056,6 +1056,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         is_draft_worker: bool = False,
         kv_layout: Union[str, KVLayout] = KVLayout.V4,
         compressed_kv_layout: Optional[str] = None,
+        candidate_source_layer_id: int = -1,
+        candidate_block_size: int = 0,
     ):
         super().__init__(
             swa_size,
@@ -1341,6 +1343,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
         self.full_size = full_size
         self.kv_source_layers = list(kv_source_layers)
+        # The two-level candidate index: A5's QSLI keeps its merged index-K
+        # records next to the indexer pool of this candidate source layer.
+        self.candidate_source_layer_id = candidate_source_layer_id
+        self.candidate_block_size = candidate_block_size
         self.sources_by_ratio = collect_sources_by_ratio(
             self.compression_ratios,
             self.kv_source_layers,
@@ -1724,6 +1730,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             else:
                 item_lens.append(t[0].nbytes if ONLINE_C128 else t[0].nbytes * 128)
         return data_ptrs, data_lens, item_lens
+
+    def get_request_state_layer_ids(self) -> List[int]:
+        """Global layer id for each entry of ``get_request_state_buf_infos``."""
+        layer_ids: List[int] = []
+        for layer_id, pool in enumerate(self.compress_state_pools):
+            if pool is None or not pool.request_scoped:
+                continue
+            layer_ids.append(layer_id)
+        return layer_ids
 
     def _init_compressed_pools(
         self,

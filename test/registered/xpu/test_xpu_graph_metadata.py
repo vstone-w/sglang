@@ -243,6 +243,7 @@ class TestXPUGraphMetadata(CustomTestCase):
                     get_pp_proxy_topk_size = lambda self: 0
                     get_pp_proxy_residual_num_blocks = lambda self: 0
                     get_pp_proxy_dspark_hidden_size = lambda self: 0
+                    get_pp_proxy_hc_pre_width = lambda self: 0
                     attn_tp_sequence_sharded = lambda self: False
                     attention_layers = []
                     mha_companion_layers = []

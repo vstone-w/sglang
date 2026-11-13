@@ -12,7 +12,7 @@ import os
 import pickle
 import time
 from collections import deque
-from typing import Any, Deque, Dict, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.distributed import TCPStore

@@ -146,6 +146,8 @@ def _low_ratio_backend(*, ratios=(1, 2), window=128):
     backend._dsv4_has_low_ratio = any(
         r in (1, 2) for r in backend._dsv4_compress_ratios
     )
+    # Non-PP layout: every layer of this stub model is on the stage.
+    backend._dsv4_stage_layer_ids = frozenset(range(len(backend._dsv4_compress_ratios)))
     backend._dsv4_sliding_window_size = window
     backend._dsv4_q_head_num = 64
     backend._dsv4_head_dim = 512
