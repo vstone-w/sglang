@@ -1164,6 +1164,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if not self._is_generic_kvcache_state_type(st):
                 # Mamba, DSA tail and MiniMax send paths check their own layout.
                 continue
+            if not self.kv_args.state_data_ptrs[i]:
+                # This rank registers an empty placeholder for a component a
+                # full-model peer has (a PP stage without those layers); it
+                # sends nothing, so there is no layout to match.
+                continue
             dst_data_ptrs = (
                 registration_info.dst_state_data_ptrs[i]
                 if i < len(registration_info.dst_state_data_ptrs)

@@ -8,11 +8,10 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import dataclasses
 import logging
-import os
 import pickle
 import time
 from collections import deque
-from typing import Any, Deque, Dict, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.distributed import TCPStore
@@ -24,6 +23,7 @@ except ImportError:  # older torch builds only have the *_tensor names
     from torch.distributed import all_gather_into_tensor as _all_gather_single
     from torch.distributed import reduce_scatter_tensor as _reduce_scatter_single
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_resources
 
 all_gather_single = _all_gather_single
@@ -107,6 +107,49 @@ def split_tensor_along_last_dim(
     return tensor_list
 
 
+def parse_pp_layer_partition(partition_list_str: str) -> List[int]:
+    """Per-rank layer counts from ``SGLANG_PP_LAYER_PARTITION``."""
+    try:
+        return [int(layer) for layer in partition_list_str.split(",")]
+    except ValueError as err:
+        raise ValueError(
+            f"Invalid partition string: {partition_list_str}"
+        ) from err
+
+
+def compute_pp_indices(
+    num_hidden_layers: int,
+    pp_rank: int,
+    pp_size: int,
+    partition: Optional[Sequence[int]] = None,
+) -> Tuple[int, int]:
+    """Layer range for one pipeline rank.
+
+    ``partition`` is the explicit per-rank layer count; ``None`` is the even
+    split, where the last ``num_hidden_layers % pp_size`` partitions take one
+    extra layer. ``get_pp_indices`` parses SGLANG_PP_LAYER_PARTITION and
+    delegates here, so callers that validate a split before it is applied use
+    the same arithmetic the runtime will.
+    """
+    if partition is not None:
+        if len(partition) != pp_size:
+            raise ValueError(f"{len(partition)=} does not match {pp_size=}.")
+        if sum(partition) != num_hidden_layers:
+            raise ValueError(f"{sum(partition)=} does not match {num_hidden_layers=}.")
+        start_layer = sum(partition[:pp_rank])
+        return start_layer, start_layer + partition[pp_rank]
+
+    base_layers = num_hidden_layers // pp_size
+    remainder = num_hidden_layers % pp_size
+    # Distribute the extra layers to the last 'remainder' partitions.
+    if pp_rank >= pp_size - remainder:
+        partitions_without_extra_layer = pp_size - remainder
+        start_layer = pp_rank * (base_layers + 1) - partitions_without_extra_layer
+        return start_layer, start_layer + (base_layers + 1)
+    start_layer = pp_rank * base_layers
+    return start_layer, start_layer + base_layers
+
+
 def get_pp_indices(
     num_hidden_layers: int, pp_rank: int, pp_size: int
 ) -> Tuple[int, int]:
@@ -114,40 +157,17 @@ def get_pp_indices(
     If the number of layers is not divisible by the number of partitions,
     the last N partitions will have one extra layer, where N = remainder.
     """
-    # partition_list_str can be set to None in sglang
-    partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
-    if pp_size == 1:
-        # A singleton draft PP group owns every layer and must ignore the target's
-        # process-global pipeline partition list.
-        partition_list_str = None
+    partition_list_str = (
+        None
+        if pp_size == 1
+        # A singleton draft PP group owns every layer and must ignore the
+        # target's process-global pipeline partition list.
+        else envs.SGLANG_PP_LAYER_PARTITION.get()
+    )
     if partition_list_str is not None:
-        try:
-            partitions = [int(layer) for layer in partition_list_str.split(",")]
-        except ValueError as err:
-            raise ValueError(
-                "Invalid partition string: {}".format(partition_list_str)
-            ) from err
-        if len(partitions) != pp_size:
-            raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
-        if sum(partitions) != num_hidden_layers:
-            raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
-        start_layer = sum(partitions[:pp_rank])
-        end_layer = start_layer + partitions[pp_rank]
-    else:
-        base_layers = num_hidden_layers // pp_size
-        remainder = num_hidden_layers % pp_size
-        # Distribute the extra layers to the last 'remainder' partitions
-        if pp_rank >= pp_size - remainder:
-            partitions_without_extra_layer = pp_size - remainder
-            # This partition gets one extra layer
-            start_layer = pp_rank * (base_layers + 1) - partitions_without_extra_layer
-            end_layer = start_layer + (base_layers + 1)
-        else:
-            # This partition gets only base layers
-            start_layer = pp_rank * base_layers
-            end_layer = start_layer + base_layers
-
-    return (start_layer, end_layer)
+        partitions = parse_pp_layer_partition(partition_list_str)
+        return compute_pp_indices(num_hidden_layers, pp_rank, pp_size, partitions)
+    return compute_pp_indices(num_hidden_layers, pp_rank, pp_size)
 
 
 @dataclasses.dataclass

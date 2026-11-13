@@ -10,6 +10,7 @@ import torch
 from sglang.srt.arg_groups import deepseek_v4_hook
 from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import eager_runner
 from sglang.srt.models import deepseek_v4, deepseek_v4_nextn
@@ -83,7 +84,7 @@ class TestCpBoundedReplayOutput(CustomTestCase):
                     )
                     torch.nn.Module.__init__(body)
                     body.pp_group = SimpleNamespace(
-                        is_first_rank=False, is_last_rank=True
+                        is_first_rank=False, is_last_rank=True, world_size=1
                     )
                     body.hc_mult, body.hidden_size = 1, 2
                     body.dspark_layers_to_capture = [0] if capture else None
@@ -91,7 +92,7 @@ class TestCpBoundedReplayOutput(CustomTestCase):
                     body._can_run_tbo = mock.Mock(return_value=False)
                     body.norm = torch.nn.Identity()
 
-                    def layers(*args):
+                    def layers(*args, **kwargs):
                         packer = args[-1]
                         if packer is not None:
                             packer.slot(markers).copy_(markers + 5000)
@@ -122,9 +123,9 @@ class TestCpBoundedReplayOutput(CustomTestCase):
                             ids,
                             batch,
                             None,
-                            pp_proxy_tensors={
-                                "hidden_states": torch.zeros(local_tokens, 1, 2)
-                            },
+                            pp_proxy_tensors=PPProxyTensors(
+                                {"hidden_states": torch.zeros(local_tokens, 1, 2)}
+                            ),
                         )
                     if capture:
                         (hidden, pre), aux = output
@@ -416,6 +417,7 @@ class TestCpBoundedReplayConfiguration(CustomTestCase):
                 enable_hisparse=False,
                 enable_two_batch_overlap=False,
                 pp_size=1,
+                language_model_only=True,
                 speculative_algorithm=None,
                 disaggregation_mode="null",
                 enable_decoder_swa_bounded_replay=True,
@@ -428,7 +430,8 @@ class TestCpBoundedReplayConfiguration(CustomTestCase):
                     deepseek_v4_hook,
                     "model_config_of",
                     return_value=SimpleNamespace(
-                        hf_config=SimpleNamespace(model_type="deepseek_v41")
+                        hf_config=SimpleNamespace(model_type="deepseek_v41"),
+                        hf_text_config=SimpleNamespace(),
                     ),
                 ),
                 mock.patch(

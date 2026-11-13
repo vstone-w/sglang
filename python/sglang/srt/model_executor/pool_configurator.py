@@ -70,6 +70,11 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 
 
+# A stage with no token-scaled KV cannot bound the PP token capacity; report a
+# sentinel that the PP MIN reduce ignores rather than capping the pipeline.
+_NO_LOCAL_TOKEN_LIMIT = 1 << 62
+
+
 def spec_decode_alloc_len_per_request(
     *,
     page_size,
@@ -1237,6 +1242,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     The bias covers request-scoped pools that do not scale with full tokens.
     """
 
+    # Memory-derived request cap: the estimate is clamped into this range
+    # before the full-token term bounds it. The floor is also the answer when
+    # no pool scales with the token count.
+    _MIN_ESTIMATED_REQUESTS = 2048
+    _MAX_ESTIMATED_REQUESTS = 4096
+
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
     _npu_low_ratio_bf16 = False
@@ -1838,10 +1849,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # a larger fixed bias yields a smaller full_token.
         if self.requested_max_running_requests_per_worker is not None:
             return self.requested_max_running_requests_per_worker
+        if self.bytes_per_full_token <= 0:
+            # No pool on this stage scales with the token count (all ratio 0):
+            # memory bounds nothing, so use the same estimate range's floor.
+            return self._MIN_ESTIMATED_REQUESTS
 
         full_token = int(available_bytes / self.bytes_per_full_token)
         estimated = int(full_token / self.context_len * 512)
-        estimated = max(min(estimated, 4096), 2048)
+        estimated = max(
+            min(estimated, self._MAX_ESTIMATED_REQUESTS),
+            self._MIN_ESTIMATED_REQUESTS,
+        )
         return min(estimated, full_token // 2)
 
     def _fixed_swa_bytes(self, max_running_requests: int) -> int:
@@ -1936,16 +1954,32 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             + c4_state_fixed_bytes
         )
         available_bytes_for_tokens = max(available_bytes - fixed_bytes, 0)
-        full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
-        full_token = full_token // page_size * page_size
-        # The coefficient excludes reserved pages. Remove the few full pages
-        # needed to cover them, including indexer rounding at this capacity.
-        while full_token > 0 and (
-            full_token * self.bytes_per_full_token
-            + self._get_low_ratio_kv_padding_bytes(full_token)
-            > available_bytes_for_tokens
-        ):
-            full_token -= page_size
+        if self.bytes_per_full_token > 0:
+            full_token = int(
+                available_bytes_for_tokens / self.bytes_per_full_token
+            )
+            full_token = full_token // page_size * page_size
+            # The coefficient excludes reserved pages. Remove the few full
+            # pages needed to cover them, including indexer rounding.
+            while full_token > 0 and (
+                full_token * self.bytes_per_full_token
+                + self._get_low_ratio_kv_padding_bytes(full_token)
+                > available_bytes_for_tokens
+            ):
+                full_token -= page_size
+        else:
+            # A stage whose layers are all ratio 0 keeps only fixed SWA
+            # windows: no pool grows with the token count, so the local budget
+            # cannot bound it and the fixed pools still have to fit.
+            if fixed_bytes > available_bytes:
+                raise RuntimeError(
+                    f"The DSV4 fixed pools ({fixed_bytes / (1 << 30):.2f} GB) "
+                    f"exceed the available {available_bytes / (1 << 30):.2f} GB "
+                    "on this stage. Reduce --max-running-requests or increase "
+                    "--mem-fraction-static."
+                )
+            full_token = get_schedule().max_total_tokens or _NO_LOCAL_TOKEN_LIMIT
+            full_token = full_token // page_size * page_size
         if full_token <= 0 and self.swa_cap_tokens is not None:
             raise RuntimeError(
                 f"The DSV4 SWA pool cap ({self.swa_cap_tokens} tokens, "

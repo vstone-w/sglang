@@ -1725,6 +1725,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 item_lens.append(t[0].nbytes if ONLINE_C128 else t[0].nbytes * 128)
         return data_ptrs, data_lens, item_lens
 
+    def get_request_state_layer_ids(self) -> List[int]:
+        """Global layer id for each entry of :meth:`get_request_state_buf_infos`.
+
+        The request-state wire is positional across PP stages; publishing the
+        ids lets a stage that owns only a subset of the request-scoped pools
+        (e.g. one ratio-2 kv_source) pair its entries with a PP=1 decode peer
+        instead of shifting them.
+        """
+        layer_ids: List[int] = []
+        for layer_id, pool in enumerate(self.compress_state_pools):
+            if pool is None or not pool.request_scoped:
+                continue
+            layer_ids.append(layer_id)
+        return layer_ids
+
     def _init_compressed_pools(
         self,
         *,

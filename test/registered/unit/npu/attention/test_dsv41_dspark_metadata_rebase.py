@@ -55,7 +55,7 @@ def build_backend():
     pool_module = ModuleType("sglang.srt.mem_cache.deepseek_v4_memory_pool")
     pool_module.DSV41_INDEX_PAGE_SIZE = 64
 
-    def make(arch35, width, *, draft=False, bs=3):
+    def make(arch35, width, *, draft=False, bs=3, ratios=None):
         source = ast.parse(BACKEND.read_text())
         low_ratio = next(
             node
@@ -143,10 +143,13 @@ def build_backend():
         backend.page_size = 128
         backend.is_hybrid_swa = False
         backend.is_draft_worker = draft
-        backend._dsv4_has_low_ratio = not draft
-        backend._dsv4_has_c4 = backend._dsv4_has_c128 = False
-        backend._dsv4_compress_ratios = () if draft else (0, 1, 2)
-        backend._dsv4_unique_compress_ratios = backend._dsv4_compress_ratios
+        if ratios is None:
+            ratios = () if draft else (0, 1, 2)
+        backend._dsv4_has_low_ratio = any(r in (1, 2) for r in ratios)
+        backend._dsv4_has_c4 = 4 in ratios
+        backend._dsv4_has_c128 = 128 in ratios
+        backend._dsv4_compress_ratios = ratios
+        backend._dsv4_unique_compress_ratios = list(dict.fromkeys(ratios))
         backend._dsv4_q_head_num = 64 if arch35 else 8
         backend._dsv4_kv_head_num = 1
         backend._dsv4_head_dim = 512
@@ -333,6 +336,39 @@ def test_a3_draft_capture_initializes_own_metadata_and_replay_keeps_addresses(
         assert operator.call_args.kwargs["metadata"].data_ptr() == pointer
     assert b.test_ops.a3.attention.call_args.kwargs["ori_mask_mode"] == 0
     b.test_ops.host.assert_not_called()
+
+
+def test_ratio0_only_stage_captures_swa_metadata_only(build_backend):
+    # A PP stage of ratio-0 layers still runs the SWA kernel, and only that.
+    b = build_backend(False, 5, bs=2, ratios=(0, 0))
+    fm = _capture(b, _batch([128, 129], 5))
+    assert set(fm.kernel_metadata) == {"c1a_metadata"}
+    for name in ("c4_page_table", "c128_page_table", "c4_topk_indices"):
+        assert not hasattr(fm, name)
+
+
+def test_c4_only_stage_captures_c4_metadata(build_backend):
+    b = build_backend(False, 5, bs=2, ratios=(0, 4))
+    fm = _capture(b, _batch([128, 129], 5))
+    assert set(fm.kernel_metadata) == {
+        "c1a_metadata",
+        "c4a_metadata",
+        "li_quant_metadata",
+    }
+    assert hasattr(fm, "c4_page_table")
+    assert hasattr(fm, "positions_cmp_padding_c4")
+    assert not hasattr(fm, "c128_page_table")
+    assert not hasattr(fm, "positions_cmp_padding_c128")
+
+
+def test_c128_only_stage_captures_c128_metadata(build_backend):
+    b = build_backend(False, 5, bs=2, ratios=(0, 128))
+    fm = _capture(b, _batch([128, 129], 5))
+    assert set(fm.kernel_metadata) == {"c1a_metadata", "c128a_metadata"}
+    assert hasattr(fm, "c128_page_table")
+    assert hasattr(fm, "positions_cmp_padding_c128")
+    assert not hasattr(fm, "c4_page_table")
+    assert not hasattr(fm, "positions_cmp_padding_c4")
 
 
 def test_a5_draft_capture_uses_the_a5_dispatch_table_only(build_backend):

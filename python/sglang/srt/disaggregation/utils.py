@@ -37,6 +37,7 @@ from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
     get_spec,
 )
 from sglang.srt.utils import is_npu
@@ -1476,7 +1477,12 @@ def build_kv_layer_ids(
     # The owner region reports the ids its entries pair by. A unified pool's
     # owner region is one whole-envelope entry with none, yet a pool wrapping
     # one token KV view still pairs its draft's entries by id.
-    layer_ids = list(storage.regions(storage.owner).layer_ids)
+    # A pool whose wire order is organized by buffer type (DSV4's ratio groups)
+    # reports its own per-entry layer ids; the owner region has none.
+    pool_layer_ids = getattr(token_to_kv_pool, "get_contiguous_buf_layer_ids", None)
+    layer_ids = list(pool_layer_ids()) if pool_layer_ids is not None else []
+    if not layer_ids:
+        layer_ids = list(storage.regions(storage.owner).layer_ids)
     if not layer_ids and token_to_kv_pool.layer_router.wrapped_view() is None:
         return []
     if draft_token_to_kv_pool is None:
@@ -1876,6 +1882,24 @@ def setup_state_kv_args(
         if isinstance(owner_view, DeepSeekV4TokenToKVPool)
         else None
     )
+    # PP positional slicing needs the model-wide low-ratio source layers: a
+    # ratio-1/2 layer without its own buffer reads the nearest source, so the
+    # ratio list alone cannot say which layers own one or how groups are sized.
+    kv_args.mla_source_layer_ids = None
+    if isinstance(owner_view, DeepSeekV4TokenToKVPool):
+        low_ratio_sources: Dict[int, List[int]] = {}
+        for layer in owner_view.kv_source_layers:
+            if layer >= len(owner_view.compression_ratios):
+                continue
+            ratio = owner_view.compression_ratios[layer]
+            if ratio in (1, 2):
+                low_ratio_sources.setdefault(ratio, []).append(layer)
+        for layers in low_ratio_sources.values():
+            if layers != sorted(layers):
+                raise ValueError(
+                    "kv_source_layer_ids must be ascending for PP positional slicing"
+                )
+        kv_args.mla_source_layer_ids = low_ratio_sources or None
     kv_args.kv_packable = _nixl_kv_packable(owner_view, draft_token_to_kv_pool)
     for entry in storage.wire_entries():
         region = storage.regions(entry.sub_pool, part=entry.part)
@@ -1949,6 +1973,20 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
         return None
 
     from sglang.srt.disaggregation.base.conn import StateType
+
+    # Only the last PP stage hosts the draft runner and its SWA state, so the
+    # per-rank fields below differ across prefill stages. Keep the wire schema
+    # rank-uniform under PP: both the bootstrap registration and the decode
+    # peer compare this dict across ranks.
+    if get_parallel().pp_size > 1:
+        if kv_args.state_types.count(StateType.SWA) < 1:
+            raise RuntimeError(
+                "DeepSeek-V4.1 DSpark PD requires target SWA state"
+            )
+        return {
+            "num_draft_tokens": get_spec().speculative_num_draft_tokens,
+            "compression_ratios": list(ratios),
+        }
 
     if kv_args.state_types.count(StateType.SWA) != 2:
         raise RuntimeError(

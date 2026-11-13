@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups.engram_config import (
     EngramConfig,
@@ -20,6 +20,10 @@ from sglang.srt.arg_groups.overrides import (
     _deepseek_v4_kv_cache_dtype,
     declare_resolution,
     run_post_process_pass,
+)
+from sglang.srt.distributed.utils import (
+    compute_pp_indices,
+    parse_pp_layer_partition,
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -311,6 +315,266 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
         )
 
 
+_COMPRESSED_RATIOS = (1, 2)
+
+
+def compute_pp_ranges(
+    num_hidden_layers: int,
+    pp_size: int,
+    partition: Optional[Sequence[int]] = None,
+) -> List[Tuple[int, int]]:
+    """Per-rank [start, end) ranges from the runtime's own split kernel."""
+    if pp_size <= 0:
+        raise ValueError(f"pp_size must be positive, got {pp_size}")
+    if partition is not None and any(count <= 0 for count in partition):
+        raise ValueError(
+            f"SGLANG_PP_LAYER_PARTITION has a non-positive stage: {partition}"
+        )
+    return [
+        compute_pp_indices(num_hidden_layers, pp_rank, pp_size, partition)
+        for pp_rank in range(pp_size)
+    ]
+
+
+def _model_layer_ratios(hf_config: Any, num_hidden_layers: int) -> List[int]:
+    """compress_ratios for the decoder layers only (nextn entries trail)."""
+    ratios = list(hf_config.compress_ratios or ())
+    if len(ratios) < num_hidden_layers:
+        ratios.extend([0] * (num_hidden_layers - len(ratios)))
+    return ratios[:num_hidden_layers]
+
+
+def _source_layers(
+    hf_config: Any, field: str, num_hidden_layers: int
+) -> List[int]:
+    return sorted(
+        int(layer)
+        for layer in (getattr(hf_config, field, None) or ())
+        if 0 <= int(layer) < num_hidden_layers
+    )
+
+
+def _block_source_consumer_groups(
+    sources: Sequence[int],
+    ratios: Sequence[int],
+    num_hidden_layers: int,
+    blocked: set,
+) -> None:
+    """Forbid a stage boundary between a source and its same-ratio readers.
+
+    A compressed layer reads the nearest earlier source of its ratio; every
+    same-ratio layer before the next source depends on that source, even when
+    other ratios are interleaved.
+    """
+    for ratio in _COMPRESSED_RATIOS:
+        group_sources = [layer for layer in sources if ratios[layer] == ratio]
+        for index, source in enumerate(group_sources):
+            stop = (
+                group_sources[index + 1]
+                if index + 1 < len(group_sources)
+                else num_hidden_layers
+            )
+            consumers = [
+                layer for layer in range(source + 1, stop) if ratios[layer] == ratio
+            ]
+            if consumers:
+                blocked.update(range(source + 1, consumers[-1] + 1))
+
+
+def legal_split_points(
+    hf_config: Any, num_hidden_layers: int, *, is_dspark: bool = False
+) -> List[int]:
+    """Layer boundaries a stage may start/end at without splitting a group."""
+    ratios = _model_layer_ratios(hf_config, num_hidden_layers)
+    blocked = set()
+    # kv sources publish the compressed KV; index sources publish the top-k
+    # the same-ratio consumers attend with. Both stay per-forward state.
+    for field in ("kv_source_layer_ids", "index_source_layer_ids"):
+        _block_source_consumer_groups(
+            _source_layers(hf_config, field, num_hidden_layers),
+            ratios,
+            num_hidden_layers,
+            blocked,
+        )
+    candidate = int(hf_config.candidate_source_layer_id)
+    if 0 <= candidate < num_hidden_layers:
+        blocked.update(range(candidate + 1, num_hidden_layers))
+    if is_dspark:
+        capture_layers = [
+            int(layer)
+            for layer in (
+                getattr(hf_config, "dspark_target_layer_ids", None) or ()
+            )
+            if 0 <= int(layer) < num_hidden_layers
+        ]
+        if capture_layers:
+            # The draft lives on the last stage, so every capture layer must
+            # start at or before the last stage's first layer.
+            blocked.update(range(min(capture_layers) + 1, num_hidden_layers))
+    return [
+        boundary for boundary in range(num_hidden_layers + 1) if boundary not in blocked
+    ]
+
+
+def suggested_partition(
+    hf_config: Any, pp_size: int, *, is_dspark: bool = False
+) -> str:
+    """A legal split that minimizes the largest stage; "" when none exists."""
+    num_hidden_layers = int(hf_config.num_hidden_layers)
+    boundaries = legal_split_points(
+        hf_config, num_hidden_layers, is_dspark=is_dspark
+    )
+    inner = [point for point in boundaries if 0 < point < num_hidden_layers]
+    if pp_size - 1 > len(inner):
+        return ""
+    # Bounded dynamic program: best[k][j] is the minimal (largest stage, sum of
+    # squares) for k stages ending at cut j, with its per-stage sizes. Both
+    # criteria compose across a split, so the lexicographic optimum carries.
+    cuts = [0, *inner, num_hidden_layers]
+    num_cuts = len(cuts)
+    best: List[Optional[Tuple[Tuple[int, int], Tuple[int, ...]]]] = [None] * num_cuts
+    for j in range(1, num_cuts):
+        size = cuts[j] - cuts[0]
+        best[j] = ((size, size * size), (size,))
+    for _ in range(2, pp_size + 1):
+        nxt: List[Optional[Tuple[Tuple[int, int], Tuple[int, ...]]]] = [
+            None
+        ] * num_cuts
+        for j in range(1, num_cuts):
+            for i in range(j):
+                prev = best[i]
+                if prev is None:
+                    continue
+                size = cuts[j] - cuts[i]
+                score = (max(prev[0][0], size), prev[0][1] + size * size)
+                if nxt[j] is None or score < nxt[j][0]:
+                    nxt[j] = (score, prev[1] + (size,))
+        best = nxt
+    final = best[-1]
+    return "" if final is None else ",".join(str(size) for size in final[1])
+
+
+def _pp_split_error(
+    hf_config: Any,
+    *,
+    pp_size: int,
+    partition_str: Optional[str],
+    detail: str,
+    is_dspark: bool,
+) -> ValueError:
+    num_hidden_layers = int(hf_config.num_hidden_layers)
+    boundaries = legal_split_points(hf_config, num_hidden_layers, is_dspark=is_dspark)
+    suggestion = suggested_partition(hf_config, pp_size, is_dspark=is_dspark)
+    split = (
+        f"SGLANG_PP_LAYER_PARTITION={partition_str!r}"
+        if partition_str
+        else "the default even split"
+    )
+    hint = (
+        f"For --pp-size {pp_size} use SGLANG_PP_LAYER_PARTITION={suggestion}."
+        if suggestion
+        else f"--pp-size {pp_size} has no legal split for this model."
+    )
+    return ValueError(
+        f"{split} is not a legal DeepSeek-V4.1 pipeline split: {detail} "
+        f"Compressed-KV source groups (kv_source_layer_ids), index sources "
+        f"(index_source_layer_ids), the candidate source "
+        f"({hf_config.candidate_source_layer_id}) and its consumers, and DSpark "
+        f"capture layers must stay on one PP stage. Legal stage boundaries "
+        f"among {num_hidden_layers} layers: {boundaries}. {hint}"
+    )
+
+
+def validate_dsv41_pp_partition(
+    hf_config: Any,
+    *,
+    pp_size: int,
+    partition_str: Optional[str],
+    is_dspark: bool,
+    language_model_only: bool,
+) -> None:
+    """Raise when a PP split would break DSV4.1's per-stage shared state."""
+    if pp_size <= 1:
+        return
+    num_hidden_layers = int(hf_config.num_hidden_layers)
+
+    vision_layers = int(hf_config.vision_n_layers or 0)
+    if vision_layers > 0 and not language_model_only:
+        raise ValueError(
+            "DeepSeek-V4.1 pipeline parallelism requires --language-model-only "
+            f"today: this checkpoint carries a {vision_layers}-layer vision "
+            "tower, and the vision path rejects PP at model build. Use "
+            "--language-model-only or a text-only checkpoint."
+        )
+
+    def split_error(detail: str) -> ValueError:
+        return _pp_split_error(
+            hf_config,
+            pp_size=pp_size,
+            partition_str=partition_str,
+            detail=detail,
+            is_dspark=is_dspark,
+        )
+
+    try:
+        partition = (
+            parse_pp_layer_partition(partition_str) if partition_str else None
+        )
+        ranges = compute_pp_ranges(num_hidden_layers, pp_size, partition)
+    except ValueError as err:
+        raise split_error(str(err)) from err
+    legal = legal_split_points(hf_config, num_hidden_layers, is_dspark=is_dspark)
+    if pp_size > len(legal) - 1:
+        raise split_error(f"pp_size={pp_size} exceeds the number of legal stages.")
+
+    ratios = _model_layer_ratios(hf_config, num_hidden_layers)
+
+    def check_sources(field: str, label: str) -> None:
+        sources = _source_layers(hf_config, field, num_hidden_layers)
+        for pp_rank, (start, end) in enumerate(ranges):
+            for layer in range(start, end):
+                ratio = ratios[layer]
+                if ratio not in _COMPRESSED_RATIOS:
+                    continue
+                layer_sources = [
+                    source
+                    for source in sources
+                    if source <= layer and ratios[source] == ratio
+                ]
+                if not layer_sources or layer_sources[-1] < start:
+                    source = layer_sources[-1] if layer_sources else None
+                    raise split_error(
+                        f"stage {pp_rank} covers layers [{start},{end}); layer "
+                        f"{layer} (compress_ratio={ratio}) needs its {label} "
+                        f"layer {source} in the same stage."
+                    )
+
+    check_sources("kv_source_layer_ids", "kv_source")
+    check_sources("index_source_layer_ids", "index source")
+
+    candidate = int(hf_config.candidate_source_layer_id)
+    if 0 <= candidate < num_hidden_layers:
+        candidate_stage = next(
+            (start, end) for start, end in ranges if start <= candidate < end
+        )
+        if candidate_stage[1] != num_hidden_layers:
+            raise split_error(
+                f"the candidate source layer {candidate} and its consumers "
+                f"layers {candidate + 1}..{num_hidden_layers - 1} are split "
+                f"across stages."
+            )
+
+    if is_dspark:
+        last_start, last_end = ranges[-1]
+        for layer in getattr(hf_config, "dspark_target_layer_ids", None) or ():
+            layer = int(layer)
+            if not (last_start <= layer < last_end):
+                raise split_error(
+                    f"DSpark capture layer {layer} is not on the last stage "
+                    f"[{last_start},{last_end}); the draft runs only there."
+                )
+
+
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_triton,
@@ -323,6 +587,17 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+    validate_dsv41_pp_partition(
+        model_config_of(server_args).hf_text_config,
+        pp_size=cfg.pp_size,
+        partition_str=envs.SGLANG_PP_LAYER_PARTITION.get(),
+        is_dspark=(
+            cfg.speculative_algorithm is not None
+            and str(cfg.speculative_algorithm).upper() == "DSPARK"
+        ),
+        language_model_only=cfg.language_model_only,
+    )
+
     if (
         cfg.dsv4_attn_backend == "trtllm"
         and cfg.cuda_graph_config.prefill.backend
@@ -387,7 +662,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             cfg.dsv4_attn_backend == "trtllm" and cfg.enable_encoder_swa_bounded_replay,
         ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
-        ("pipeline parallelism", cfg.pp_size > 1),
     )
     for feature, enabled in unsupported:
         if enabled:
@@ -464,6 +738,10 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 )
             ),
         ),
+        # The bounded-replay tail narrows the residual to tail rows and is
+        # scattered back only on the last rank; a non-last PP stage would relay
+        # tail-only rows. Its graph is also keyed by the global late-layer start.
+        ("pipeline parallelism", cfg.pp_size > 1),
     )
     if cfg.enable_decoder_swa_bounded_replay:
         for feature, unsupported in incompatible:

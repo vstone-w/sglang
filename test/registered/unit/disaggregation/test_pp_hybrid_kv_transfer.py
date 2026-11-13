@@ -366,5 +366,214 @@ class TestDraftBandPairsAcrossPipelineStages(CustomTestCase):
         )
 
 
+class _Dsv41LowRatioManager:
+    _slice_low_ratio_dst_for_pp = CommonKVManager._slice_low_ratio_dst_for_pp
+
+    def __init__(self, *, start_layer, end_layer, num_draft=0):
+        self.kv_args = SimpleNamespace(
+            # Two plain layers, 18 ratio-2 layers (sources 2, 8, 14) and 20
+            # ratio-1 layers (source 20); the trailing nextn entries are zeros.
+            mla_compression_ratios=[0, 0] + [2] * 18 + [1] * 20 + [0] * 3,
+            mla_source_layer_ids={1: [20], 2: [2, 8, 14]},
+            prefill_start_layer=start_layer,
+            prefill_end_layer=end_layer,
+            num_draft_entries=num_draft,
+        )
+
+    def slice(self, src, dst):
+        return CommonKVManager._mla_slice_ptrs_for_pp(
+            self, src, dst, self.kv_args.mla_compression_ratios
+        )[1]
+
+
+def _low_ratio_entries(kinds: int, suffix=()) -> list:
+    """Decode wire order: [ratio 1][ratio 2], each [kind][source]."""
+    entries = []
+    for layers in ([20], [2, 8, 14]):
+        for kind in range(kinds):
+            for layer in layers:
+                entries.append(f"{layer}/{kind}")
+    return entries + list(suffix)
+
+
+def _stage_entries(start: int, end: int, kinds: int, suffix=()) -> list:
+    entries = []
+    for layers in ([20], [2, 8, 14]):
+        stage = [layer for layer in layers if start <= layer < end]
+        for kind in range(kinds):
+            for layer in stage:
+                entries.append(f"{layer}/{kind}")
+    return entries + list(suffix)
+
+
+class TestDsv41LowRatioPositionalSlicing(CustomTestCase):
+    """Derived property: DSV4.1 wires compressed KV as ratio groups of source
+    layers, each [KV][index K][(index scale)] per source. A PP stage owns only
+    the sources in its layer range, so positional slicing must cut each ratio
+    group by the stage's sources and keep the draft band at the tail. Before
+    this the ratio-1/2 groups fell into the SWA fallback and paired every entry
+    with another layer's buffer."""
+
+    def test_pp2_stages_cut_their_own_ratio_group(self):
+        kinds = 3  # A5: KV, index K, index scale
+        dst = _low_ratio_entries(kinds)
+        stage0 = _stage_entries(0, 20, kinds)
+        self.assertEqual(
+            _Dsv41LowRatioManager(start_layer=0, end_layer=20).slice(stage0, dst),
+            stage0,
+        )
+        stage1 = _stage_entries(20, 40, kinds)
+        self.assertEqual(
+            _Dsv41LowRatioManager(start_layer=20, end_layer=40).slice(stage1, dst),
+            stage1,
+        )
+
+    def test_pp4_each_stage_maps_to_its_source(self):
+        kinds = 2  # A3: KV and index K only
+        dst = _low_ratio_entries(kinds)
+        for start, end, expected in (
+            (0, 8, ["2/0", "2/1"]),
+            (8, 14, ["8/0", "8/1"]),
+            (14, 20, ["14/0", "14/1"]),
+            (20, 40, ["20/0", "20/1"]),
+        ):
+            with self.subTest(start=start, end=end):
+                stage = _stage_entries(start, end, kinds)
+                self.assertEqual(
+                    _Dsv41LowRatioManager(start_layer=start, end_layer=end).slice(
+                        stage, dst
+                    ),
+                    expected,
+                )
+
+    def test_draft_band_stays_after_the_target_slice(self):
+        kinds = 3
+        dst = _low_ratio_entries(kinds, suffix=["draft/0", "draft/1"])
+        stage = _stage_entries(20, 40, kinds, suffix=["draft/0", "draft/1"])
+        self.assertEqual(
+            _Dsv41LowRatioManager(
+                start_layer=20, end_layer=40, num_draft=2
+            ).slice(stage, dst),
+            stage,
+        )
+
+    def test_stage_without_a_source_slices_nothing(self):
+        dst = _low_ratio_entries(3)
+        self.assertEqual(
+            _Dsv41LowRatioManager(start_layer=0, end_layer=1).slice([], dst),
+            [],
+        )
+
+    def test_peer_registration_with_a_different_section_is_rejected(self):
+        # An A3 (2 kinds) decode section against an A5 (3 kinds) stage.
+        dst = _low_ratio_entries(2)
+        stage = _stage_entries(0, 20, 3)
+        with self.assertRaisesRegex(ValueError, "low-ratio KV layout"):
+            _Dsv41LowRatioManager(start_layer=0, end_layer=20).slice(stage, dst)
+
+
+class _RecordingLowRatioAscendManager(AscendKVManager):
+    """DSV4.1 low-ratio PP prefill, exercising the legacy positional path."""
+
+    is_hybrid_mla_backend = False
+    is_mla_backend = True
+    pp_size = 2
+    enable_custom_mem_pool = False
+
+    def __init__(self, *, start_layer, end_layer, num_draft=0):
+        stage_sources = sum(
+            1
+            for layers in ([20], [2, 8, 14])
+            for layer in layers
+            if start_layer <= layer < end_layer
+        )
+        entries = stage_sources * 3 + num_draft  # A5: KV, index K, index scale
+        self.kv_args = SimpleNamespace(
+            kv_data_ptrs=list(range(100, 100 + entries)),
+            kv_item_lens=[10] * entries,
+            kv_layer_ids=[0] * entries,
+            mla_compression_ratios=[0, 0] + [2] * 18 + [1] * 20 + [0] * 3,
+            mla_source_layer_ids={1: [20], 2: [2, 8, 14]},
+            prefill_start_layer=start_layer,
+            prefill_end_layer=end_layer,
+            num_draft_entries=num_draft,
+        )
+        self.generic_call = None
+        self.blocks = []
+
+    def _validate_envelope_kv_layout(self, *args):
+        pass
+
+    def _send_kvcache_generic(self, **kwargs):
+        self.generic_call = kwargs
+        return 7
+
+    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+        self.blocks.extend(transfer_blocks)
+        return 0
+
+
+# The decode pool covers the whole model: ratio 1 [20] then ratio 2 [2, 8, 14],
+# three buffer kinds per source.
+_DECODE_LOW_RATIO_PTRS = list(range(200, 212))
+_DECODE_LAYER_IDS = [20, 20, 20, 2, 8, 14, 2, 8, 14, 2, 8, 14]
+
+
+def _send_low_ratio(manager, *, dst_ptrs):
+    return AscendKVManager.send_kvcache(
+        manager,
+        mooncake_session_id="session",
+        prefill_kv_indices=np.array([0, 1], dtype=np.int32),
+        dst_kv_ptrs=dst_ptrs,
+        dst_kv_indices=np.array([0, 1], dtype=np.int32),
+        executor=None,
+        dst_layer_ids=_DECODE_LAYER_IDS,
+    )
+
+
+class TestDsv41AscendUsesMlaPath(CustomTestCase):
+    """Derived property: DSV4.1 is MLA but not hybrid, so the Ascend dispatch
+    must keep it on the positional path and slice its ratio-1/2 source groups
+    there, rather than routing it through the layer-id generic path."""
+
+    def test_stage0_slices_the_ratio2_group(self):
+        manager = _RecordingLowRatioAscendManager(start_layer=0, end_layer=20)
+        rc = _send_low_ratio(manager, dst_ptrs=_DECODE_LOW_RATIO_PTRS)
+        self.assertEqual(rc, 0)
+        self.assertIsNone(manager.generic_call)
+        self.assertEqual(
+            manager.blocks,
+            [(src, dst, 20) for src, dst in zip(range(100, 109), range(203, 212))],
+        )
+
+    def test_last_stage_slices_the_ratio1_group(self):
+        manager = _RecordingLowRatioAscendManager(start_layer=20, end_layer=40)
+        rc = _send_low_ratio(manager, dst_ptrs=_DECODE_LOW_RATIO_PTRS)
+        self.assertEqual(rc, 0)
+        self.assertIsNone(manager.generic_call)
+        self.assertEqual(
+            manager.blocks,
+            [(src, dst, 20) for src, dst in zip(range(100, 103), range(200, 203))],
+        )
+
+    def test_draft_band_is_transferred_last(self):
+        manager = _RecordingLowRatioAscendManager(
+            start_layer=20, end_layer=40, num_draft=2
+        )
+        rc = _send_low_ratio(
+            manager,
+            dst_ptrs=_DECODE_LOW_RATIO_PTRS + [212, 213],
+        )
+        self.assertEqual(rc, 0)
+        self.assertIsNone(manager.generic_call)
+        self.assertEqual(
+            manager.blocks,
+            [
+                (src, dst, 20)
+                for src, dst in zip(range(100, 105), [200, 201, 202, 212, 213])
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

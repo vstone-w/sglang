@@ -1875,6 +1875,14 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _request_state_payload():
                 kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+                # A PP stage that owns no request-scoped layer registers an
+                # empty placeholder to keep the wire order aligned; it has no
+                # indices to send.
+                if not any(
+                    pool is not None and pool.request_scoped
+                    for pool in getattr(kvcache, "compress_state_pools", ())
+                ):
+                    return None
                 return kvcache.request_state_transfer_indices(
                     int(req.kv.req_pool_idx), c128_seq_len
                 )

@@ -215,6 +215,12 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         runner = self._decode_runner
         if runner is None or forward_batch.needs_forward_metadata_init():
             return False
+        if runner.buffers.pp_proxy_tensors is not None:
+            # PP is only validated on the generic load_batch path: the replay
+            # refreshes the proxy rows, but this pre-planned path skips the
+            # rest of load_batch's PP preparation. Restore the fast path only
+            # with a graph-enabled PP run to compare against.
+            return False
         if not runner.model_runner.spec_algorithm.is_dflash():
             # Preserve the NPU pre-planned path without refreshing metadata
             # or running the common load_batch preparation.

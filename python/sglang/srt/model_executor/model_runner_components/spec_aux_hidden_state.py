@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import msgspec
 
 from sglang.srt.configs.model_config import ModelConfig, uses_compressed_kv_attention
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -199,6 +199,36 @@ def _resolve_eagle_aux_hidden_state(
             config.eagle_aux_hidden_state_layer_ids = None
 
 
+def validate_pp_capture_layers(
+    *, layer_ids: Sequence[int], num_hidden_layers: int, pp_size: int
+) -> None:
+    """Reject draft-captured target layers that straddle PP stages.
+
+    The draft is hosted only on the last pipeline stage, so every layer it
+    captures must live there. The runtime capture set comes from the draft's
+    own config, which may differ from the target's ``dspark_target_layer_ids``.
+    """
+    if pp_size <= 1 or not layer_ids:
+        return
+    from sglang.srt.distributed.utils import get_pp_indices
+
+    # The runtime's own split, including SGLANG_PP_LAYER_PARTITION.
+    last_start, _ = get_pp_indices(num_hidden_layers, pp_size - 1, pp_size)
+    off_stage = sorted(
+        {
+            int(layer)
+            for layer in layer_ids
+            if not last_start <= int(layer) < num_hidden_layers
+        }
+    )
+    if off_stage:
+        raise ValueError(
+            f"Draft capture layers {off_stage} are not on the last pipeline "
+            f"stage (PP{pp_size} starts it at layer {last_start}). The draft "
+            "runs only on the last stage; adjust SGLANG_PP_LAYER_PARTITION."
+        )
+
+
 def _resolve_dflash_aux_hidden_state(
     *,
     config: SpecAuxHiddenStateConfig,
@@ -284,3 +314,11 @@ def _resolve_dflash_aux_hidden_state(
         config.draft_model_config = draft_model_config
         config.draft_kv_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
+        if spec_algorithm.is_dspark():
+            # DSpark hosts its draft only on the last PP stage; DFlash keeps
+            # its own placement contract.
+            validate_pp_capture_layers(
+                layer_ids=target_layer_ids,
+                num_hidden_layers=int(target_num_layers),
+                pp_size=get_parallel().pp_size,
+            )

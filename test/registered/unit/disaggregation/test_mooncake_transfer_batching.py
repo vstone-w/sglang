@@ -682,6 +682,7 @@ class TestMooncakeEarlySend(CustomTestCase):
             dst_kv_ptrs=[1000],
             dst_kv_layer_ids=[0],
             dst_kv_item_len=16,
+            dst_kv_item_lens=[16],
             dst_attn_tp_size=1,
             dst_aux_ptrs=[2000],
             dst_aux_item_lens=[16],

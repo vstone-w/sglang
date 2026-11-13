@@ -733,6 +733,44 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
         return data_ptrs, data_lens, item_lens
 
+    def get_contiguous_buf_layer_ids(self) -> List[int]:
+        """Global layer id for every entry of ``get_contiguous_buf_infos``.
+
+        The wire order is buffer-type organized (ratio groups, then KV/index-K/
+        index-scale), so a PP stage that misses one low ratio cannot pair its
+        entries positionally against a PP=1 decode peer. Publishing the ids lets
+        the PD transfer pair by layer instead.
+        """
+        layer_ids: List[int] = []
+
+        if self.c4_kv_pool is not None:
+            c4_layers = self.sources_by_ratio.get(4, [])
+            indexer_pool = self._indexer_pool(4)
+            layer_ids.extend(c4_layers[: len(self.c4_kv_pool.kv_buffer)])
+            layer_ids.extend(c4_layers[: len(indexer_pool.index_k_buffer)])
+            # get_contiguous_buf_infos appends every C4 scale entry (they are
+            # never empty), so mirror that order exactly.
+            layer_ids.extend(c4_layers[: len(indexer_pool.index_scale_buffer)])
+
+        for ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS:
+            kv_pool = self.kv_pools.get(ratio)
+            if kv_pool is None:
+                continue
+            sources = self.sources_by_ratio.get(ratio, [])
+            indexer_pool = self._indexer_pool(ratio)
+            layer_ids.extend(sources[: len(kv_pool.kv_buffer)])
+            # get_contiguous_buf_infos skips empty index-K and index-scale
+            # entries (A3 BF16 index K has no scale payload); mirror it so the
+            # id list stays 1:1 with the transfer entries.
+            for layer, buf in zip(sources, indexer_pool.index_k_buffer):
+                if buf.numel():
+                    layer_ids.append(layer)
+            for layer, buf in zip(sources, indexer_pool.index_scale_buffer):
+                if buf.numel():
+                    layer_ids.append(layer)
+
+        return layer_ids
+
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """GPU-compatible ``StateType.SWA`` component containing SWA KV only.
 
@@ -747,6 +785,30 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             [buf.nbytes for buf in buffers],
             [buf[0].nbytes for buf in buffers],
         )
+
+    def get_state_layer_ids(self) -> List[int]:
+        """Global layer id for each entry of ``get_state_buf_infos``.
+
+        That component is the SWA KV ring only; the C4 compress state has its
+        own component and its own ids (:meth:`get_c4_state_layer_ids`). Without
+        these ids a PP prefill stage pairs its SWA entries positionally against
+        a PP=1 decode peer.
+        """
+        return list(self.swa_layer_ids())
+
+    def get_c4_state_layer_ids(self) -> List[int]:
+        """Global layer id for each entry of ``get_c4_state_buf_infos``.
+
+        Same double traversal as the buffer getter: attention then indexer
+        compress state, ratio 4 only, so the id list stays 1:1 with the rows.
+        """
+        layer_ids: List[int] = []
+        for pools in (self.compress_state_pools, self.indexer_compress_state_pools):
+            for layer_id, pool in enumerate(pools):
+                if pool is None or pool.ratio != 4:
+                    continue
+                layer_ids.append(layer_id)
+        return layer_ids
 
     def get_c4_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """C4 compress state ring (attention + indexer).

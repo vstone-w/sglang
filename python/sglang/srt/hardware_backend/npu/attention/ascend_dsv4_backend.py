@@ -418,7 +418,7 @@ class CompressorAscendBackendMixin:
             if is_decode:
                 self._build_seq_metadata_decode(_seq_lens)
             if not is_decode:
-                for ratio in self._dsv4_compress_ratios:
+                for ratio in self._dsv4_unique_compress_ratios:
                     if ratio in (4, 128):
                         if f"c{ratio}_loc" not in result:
                             setattr(fm, f"c{ratio}_loc", None)
@@ -835,7 +835,7 @@ class CompressorAscendBackendMixin:
 
         padding_sizes = {}
         for ratio in (4, 128):
-            if ratio not in self._dsv4_compress_ratios:
+            if ratio not in self._dsv4_unique_compress_ratios:
                 continue
             padding_size = max(1, min(t, t // ratio + bs))
             padding_sizes[ratio] = padding_size
@@ -2326,6 +2326,7 @@ class LowRatioCompressAscendBackendMixin:
     _DSV41_SLOT_SKIP = -1
 
     def _dsv41_low_ratios(self) -> list:
+        # Stage-scoped: a PP stage may hold only one of ratio 1 / ratio 2.
         return [r for r in self._dsv4_unique_compress_ratios if r in (1, 2)]
 
     def _dsv41_candidate_ratio(self) -> Optional[int]:
@@ -2336,10 +2337,14 @@ class LowRatioCompressAscendBackendMixin:
         return self._dsv4_compress_ratios[layer_id]
 
     def _dsv41_has_candidate_consumers(self) -> bool:
-        """Whether any later index source layer rescoring inside the candidates."""
+        """Whether a later index source layer on this stage rescoring inside
+        the candidates. PP keeps the candidate source with its consumers."""
         source = self._dsv41_candidate_source_layer
-        return self._dsv41_candidate_ratio() is not None and any(
-            layer > source for layer in self._dsv41_index_source_layers
+        if self._dsv41_candidate_ratio() is None:
+            return False
+        return any(
+            source < layer and layer in self._dsv4_stage_layer_ids
+            for layer in self._dsv41_index_source_layers
         )
 
     def _build_low_ratio_compress_metadata(self, forward_batch: ForwardBatch) -> None:
@@ -2564,10 +2569,13 @@ class LowRatioCompressAscendBackendMixin:
         probe_cmp_lengths = torch.zeros((t, 1), dtype=torch.int32, device=device)
         for ratio in (0, *self._dsv41_low_ratios()):
             attention_type = "win" if ratio == 0 else f"c{ratio}a"
-            probe = ds41.mixed_quant_sparse_flash_mla_metadata_dsl(
+            probe_kwargs = dict(
                 ori_topk_length=metadata.dsv41_win_topk_length,
                 cmp_topk_length=probe_cmp_lengths,
                 cu_seqlens_q=cu_seqlens_q,
+                # A5's op rejects an empty seqused_ori_kv whenever has_ori_kv
+                # and layout_kv=PA_BBND, so seed it from the captured batch.
+                seqused_ori_kv=metadata.actual_seq_lengths_kv,
                 num_heads_q=int(self._dsv4_q_head_num),
                 num_heads_kv=1,
                 head_dim=int(self._dsv4_head_dim),
@@ -2577,6 +2585,13 @@ class LowRatioCompressAscendBackendMixin:
                 has_ori_kv=True,
                 has_cmp_kv=ratio > 0,
             )
+            if ratio:
+                # Same rule for the compressed side: has_cmp_kv with
+                # layout_kv=PA_BBND also needs a non-empty seqused_cmp_kv.
+                probe_kwargs["seqused_cmp_kv"] = (
+                    metadata.actual_seq_lengths_kv // ratio
+                )
+            probe = ds41.mixed_quant_sparse_flash_mla_metadata_dsl(**probe_kwargs)
             key = f"kernel_metadata_{attention_type}"
             buf = self.graph_metadata.get(key)
             if buf is None or buf.shape != probe.shape:
@@ -2905,15 +2920,28 @@ class DeepseekV4AscendAttnBackend(
         # Generation, read from the model's own ratios: a draft worker empties
         # the list below, while the spec-support gate must still classify it.
         self._dsv4_is_v41_model = any(ratio in (1, 2) for ratio in hf.compress_ratios)
-        if getattr(model_runner, "is_draft_worker", False):
+        if self.is_draft_worker:
             self._dsv4_compress_ratios = type(hf.compress_ratios)()
-        self._dsv4_has_c4 = 4 in self._dsv4_compress_ratios
-        self._dsv4_has_c128 = 128 in self._dsv4_compress_ratios
-        # DeepSeek-V4.1 generation signal. Both generations report KVLayout.V4
-        # on NPU, so the ratios themselves are the only discriminator.
-        self._dsv4_has_low_ratio = any(
-            ratio in (1, 2) for ratio in self._dsv4_compress_ratios
-        )
+            stage_ratios: tuple = ()
+        else:
+            # PP stages own disjoint layer slices; metadata and graph buffers
+            # may only cover the compress ratios actually present on this
+            # stage. A ratio absent here keeps no pool to index.
+            pool = self.token_to_kv_pool
+            stage_ratios = tuple(
+                sorted(
+                    {
+                        pool.compression_ratios[layer_id]
+                        for layer_id in pool.stage_layer_ids
+                    }
+                )
+            )
+        self._dsv4_stage_layer_ids = frozenset(self.token_to_kv_pool.stage_layer_ids)
+        self._dsv4_has_c4 = 4 in stage_ratios
+        self._dsv4_has_c128 = 128 in stage_ratios
+        # A draft worker empties its ratio list but is still classified by the
+        # model-wide generation signal; its own stage keeps no low-ratio layer.
+        self._dsv4_has_low_ratio = self._dsv4_is_v41_model and not self.is_draft_worker
         if self._dsv4_has_low_ratio and is_npu_arch35():
             # MQSMLA fixes N1 = 64 and does not shard query heads over TP; a
             # narrower per-rank width would feed the op the wrong head count.
@@ -2922,9 +2950,6 @@ class DeepseekV4AscendAttnBackend(
                 f"(got {self._dsv4_q_head_num}): check num_attention_heads and "
                 "the attention TP size."
             )
-        if self._dsv4_has_low_ratio:
-            # Both A3 indexers and the A5 metadata path require fixed Q blocks.
-            _ensure_dsv41_static_verify_mode()
         if self._dsv4_has_low_ratio and not is_npu_arch35():
             _dsv41_a3_ops()
             # Resolve the public API here; graph warmup loads the lazy binding.
@@ -2932,9 +2957,7 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )
-        self._dsv4_unique_compress_ratios = list(
-            dict.fromkeys(self._dsv4_compress_ratios)
-        )
+        self._dsv4_unique_compress_ratios = list(stage_ratios)
         self._is_dspark_algorithm = bool(
             model_runner.spec_algorithm is not None
             and model_runner.spec_algorithm.is_dspark()
@@ -2945,8 +2968,7 @@ class DeepseekV4AscendAttnBackend(
             and not model_runner.spec_algorithm.is_frozen_kv_mtp()
         )
         self._is_dspark_draft_worker = bool(
-            getattr(model_runner, "is_draft_worker", False)
-            and self._is_dspark_algorithm
+            self.is_draft_worker and self._is_dspark_algorithm
         )
         self._is_dsv41_a3_dspark_draft = (
             self._is_dspark_draft_worker
@@ -2954,7 +2976,7 @@ class DeepseekV4AscendAttnBackend(
             and not is_npu_arch35()
         )
         self._validate_spec_support(model_runner.spec_algorithm)
-        if getattr(model_runner, "is_draft_worker", False):
+        if self.is_draft_worker:
             self._validate_draft_window_rows()
         self._dsv4_graph_tokens_per_req = int(model_runner.decode_num_tokens_per_req())
         self._dsv4_state_pools_by_ratio = {
@@ -3319,6 +3341,7 @@ class DeepseekV4AscendAttnBackend(
             self.graph_metadata["c4_page_table"] = torch.full(
                 (max_bs, max_pages), -1, dtype=torch.int32, device=device
             )
+        if self._dsv4_has_c128:
             self.graph_metadata["c128_page_table"] = torch.full(
                 (max_bs, max_pages), -1, dtype=torch.int32, device=device
             )
@@ -3355,32 +3378,31 @@ class DeepseekV4AscendAttnBackend(
             if is_npu_arch35()
             else npu_attention_ops.get_sparse_flash_mla_metadata_size()
         )
+        # Every V4 graph stage runs the SWA kernel, whatever compressed ratios
+        # its layers hold (a PP stage can be all ratio 0); that kernel's one
+        # dispatch table is c1a. V4.1 stages size their own ds41 tables instead.
+        if not self._dsv4_has_low_ratio:
+            self.graph_metadata["kernel_metadata_c1a"] = torch.zeros(
+                attention_metadata_size, dtype=torch.int32, device=device
+            )
         if self._dsv4_has_c4:
-            for key in (
-                "kernel_metadata_c1a",
-                "kernel_metadata_c4a",
-                "kernel_metadata_c128a",
-            ):
-                self.graph_metadata[key] = torch.zeros(
-                    attention_metadata_size, dtype=torch.int32, device=device
-                )
+            self.graph_metadata["kernel_metadata_c4a"] = torch.zeros(
+                attention_metadata_size, dtype=torch.int32, device=device
+            )
+            # The c4 indexer's top-k metadata.
             self.graph_metadata["kernel_metadata_li_quant"] = torch.zeros(
                 npu_indexer_ops.get_quant_lightning_indexer_metadata_size(),
                 dtype=torch.int32,
                 device=device,
             )
-
             self.graph_metadata["c4_topk_indices"] = torch.full(
                 (max_num_tokens, self._dsv4_index_topk),
                 -1,
                 dtype=torch.int32,
                 device=device,
             )
-        elif self.is_draft_worker:
-            # A draft worker empties the ratio list, so it matches neither
-            # generation gate -- but its decode graphs still run the SWA
-            # kernels, whose one dispatch table is c1a_metadata.
-            self.graph_metadata["kernel_metadata_c1a"] = torch.zeros(
+        if self._dsv4_has_c128:
+            self.graph_metadata["kernel_metadata_c128a"] = torch.zeros(
                 attention_metadata_size, dtype=torch.int32, device=device
             )
 
@@ -3540,43 +3562,41 @@ class DeepseekV4AscendAttnBackend(
             )
 
         T = n_tok
+        # The SWA dispatch table is on every V4 graph stage; V4.1 attaches its
+        # own ds41 tables in _init_dsv41_graph_metadata.
+        if not self._dsv4_has_low_ratio:
+            metadata.kernel_metadata["c1a_metadata"] = self.graph_metadata[
+                "kernel_metadata_c1a"
+            ]
+        # Slot-map seeds follow the writer ABI: mqsmla (Ascend 950) skips -1,
+        # the legacy writers skip 0 (see _loc_pad_value).
         if self._dsv4_has_c4:
             c4_pad = min(n_tok, n_tok // 4 + bs)
-            c128_pad = min(n_tok, n_tok // 128 + bs)
             metadata.c4_page_table = self.graph_metadata["c4_page_table"][:bs, :]
-            metadata.c128_page_table = self.graph_metadata["c128_page_table"][:bs, :]
-            # Slot-map seeds follow the writer ABI: mqsmla (Ascend 950) skips
-            # -1, the legacy writers skip 0 (see _loc_pad_value).
             metadata.c4_loc = torch.full(
                 (c4_pad,), _loc_pad_value(), dtype=torch.int64, device=device
-            )
-            metadata.c128_loc = torch.full(
-                (c128_pad,), _loc_pad_value(), dtype=torch.int64, device=device
             )
             metadata.positions_cmp_padding_c4 = torch.zeros(
                 c4_pad, dtype=torch.int64, device=device
             )
+            metadata.kernel_metadata["c4a_metadata"] = self.graph_metadata[
+                "kernel_metadata_c4a"
+            ]
+            metadata.kernel_metadata["li_quant_metadata"] = self.graph_metadata[
+                "kernel_metadata_li_quant"
+            ]
+            metadata.c4_topk_indices = self.graph_metadata["c4_topk_indices"][:T, :]
+        if self._dsv4_has_c128:
+            c128_pad = min(n_tok, n_tok // 128 + bs)
+            metadata.c128_page_table = self.graph_metadata["c128_page_table"][:bs, :]
+            metadata.c128_loc = torch.full(
+                (c128_pad,), _loc_pad_value(), dtype=torch.int64, device=device
+            )
             metadata.positions_cmp_padding_c128 = torch.zeros(
                 c128_pad, dtype=torch.int64, device=device
             )
-            # c1a/c4a/c128a/li_quant are the V4 kernels' metadata buffers only.
-            metadata.kernel_metadata.update(
-                {
-                    "c1a_metadata": self.graph_metadata["kernel_metadata_c1a"],
-                    "c4a_metadata": self.graph_metadata["kernel_metadata_c4a"],
-                    "c128a_metadata": self.graph_metadata["kernel_metadata_c128a"],
-                    "li_quant_metadata": self.graph_metadata[
-                        "kernel_metadata_li_quant"
-                    ],
-                }
-            )
-            metadata.c4_topk_indices = self.graph_metadata["c4_topk_indices"][:T, :]
-        elif self.is_draft_worker:
-            # Draft worker decode graphs run the SWA kernels only; c1a is the
-            # one dispatch table they read. Replay refreshes it in place via
-            # _refresh_graph_kernel_metadata.
-            metadata.kernel_metadata["c1a_metadata"] = self.graph_metadata[
-                "kernel_metadata_c1a"
+            metadata.kernel_metadata["c128a_metadata"] = self.graph_metadata[
+                "kernel_metadata_c128a"
             ]
 
         if self._dsv4_has_low_ratio:
@@ -4051,56 +4071,43 @@ class DeepseekV4AscendAttnBackend(
                 ctx.final_seq_lens_cpu,
                 ctx.live_seq_lens_cpu,
             )
-            self._fill_ragged_verify_positions_cmp_padding_one(
-                positions=ctx.forward_batch.positions,
-                dst=fm.positions_cmp_padding_c4,
-                ratio=4,
-                final_seq_lens_cpu=verify_seq_lens_cpu,
-                verify_lens_cpu=ctx.effective_verify_lens_cpu,
-            )
-            self._fill_ragged_verify_positions_cmp_padding_one(
-                positions=ctx.forward_batch.positions,
-                dst=fm.positions_cmp_padding_c128,
-                ratio=128,
-                final_seq_lens_cpu=verify_seq_lens_cpu,
-                verify_lens_cpu=ctx.effective_verify_lens_cpu,
-            )
+
+            def fill_positions(ratio: int, dst: torch.Tensor) -> None:
+                self._fill_ragged_verify_positions_cmp_padding_one(
+                    positions=ctx.forward_batch.positions,
+                    dst=dst,
+                    ratio=ratio,
+                    final_seq_lens_cpu=verify_seq_lens_cpu,
+                    verify_lens_cpu=ctx.effective_verify_lens_cpu,
+                )
+
         elif self._is_eagle_algorithm or ctx.mirrorless:
-            self._fill_verify_positions_cmp_padding_one_device(
-                ctx.forward_batch.positions,
-                fm.positions_cmp_padding_c4,
-                4,
-                ctx.live_seq_lens,
-                n_draft=ctx.tokens_per_bs,
-            )
-            self._fill_verify_positions_cmp_padding_one_device(
-                ctx.forward_batch.positions,
-                fm.positions_cmp_padding_c128,
-                128,
-                ctx.live_seq_lens,
-                n_draft=ctx.tokens_per_bs,
-            )
+
+            def fill_positions(ratio: int, dst: torch.Tensor) -> None:
+                self._fill_verify_positions_cmp_padding_one_device(
+                    ctx.forward_batch.positions,
+                    dst,
+                    ratio,
+                    ctx.live_seq_lens,
+                    n_draft=ctx.tokens_per_bs,
+                )
+
         else:
-            verify_seq_lens_cpu = ctx.final_seq_lens_cpu
             verify_seq_lens_cpu = torch.where(
                 ctx.live_seq_lens_cpu > 0,
-                verify_seq_lens_cpu,
+                ctx.final_seq_lens_cpu,
                 ctx.live_seq_lens_cpu,
             )
-            self._fill_verify_positions_cmp_padding_one(
-                ctx.forward_batch.positions,
-                fm.positions_cmp_padding_c4,
-                4,
-                verify_seq_lens_cpu,
-                n_draft=ctx.tokens_per_bs,
-            )
-            self._fill_verify_positions_cmp_padding_one(
-                ctx.forward_batch.positions,
-                fm.positions_cmp_padding_c128,
-                128,
-                verify_seq_lens_cpu,
-                n_draft=ctx.tokens_per_bs,
-            )
+
+            def fill_positions(ratio: int, dst: torch.Tensor) -> None:
+                self._fill_verify_positions_cmp_padding_one(
+                    ctx.forward_batch.positions,
+                    dst,
+                    ratio,
+                    verify_seq_lens_cpu,
+                    n_draft=ctx.tokens_per_bs,
+                )
+
         bundle = getattr(ctx.forward_batch, "out_cache_loc_dsv4", None)
         # Metadata storage is reused by every replay of this token tier.  A
         # missing bundle must clear locations left by the previous request.
@@ -4109,23 +4116,19 @@ class DeepseekV4AscendAttnBackend(
         for ratio in self._dsv4_unique_compress_ratios:
             if ratio not in (4, 128):
                 continue
+            fill_positions(ratio, getattr(fm, f"positions_cmp_padding_c{ratio}"))
             loc = None
             if bundle is not None:
                 loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
             self._copy_1d_with_zero_tail(getattr(fm, f"c{ratio}_loc"), loc)
 
-    @staticmethod
-    def _clear_v4_verify_metadata(ctx) -> None:
+    def _clear_v4_verify_metadata(self, ctx) -> None:
         fm = ctx.fm
-        for tensor in (
-            fm.positions_cmp_padding_c4,
-            fm.positions_cmp_padding_c128,
-        ):
-            if tensor is not None:
-                tensor.zero_()
-        for tensor in (fm.c4_loc, fm.c128_loc):
-            if tensor is not None:
-                tensor.fill_(_loc_pad_value())
+        for ratio in self._dsv4_unique_compress_ratios:
+            if ratio not in (4, 128):
+                continue
+            getattr(fm, f"positions_cmp_padding_c{ratio}").zero_()
+            getattr(fm, f"c{ratio}_loc").fill_(_loc_pad_value())
         fm.start_pos.zero_()
         fm.seqused.zero_()
 
@@ -4244,8 +4247,9 @@ class DeepseekV4AscendAttnBackend(
         ):
             if key in kernel_metadata_new:
                 fm.kernel_metadata[key].copy_(kernel_metadata_new[key])
-        # A3 drafts have no C4 pool; retain the upstream A5 refresh behavior.
-        if is_npu_arch35() or self._dsv4_has_c4:
+        # Only a stage with a C4 pool registers this buffer (and keeps C4
+        # consumers); a draft worker and every V4.1 stage skip it.
+        if self._dsv4_has_c4:
             fm.c4_topk_indices.fill_(-1)
 
     def _apply_dsv4_graph_metadata(
@@ -5035,10 +5039,6 @@ class DeepseekV4AscendAttnBackend(
             return
         fm = self.forward_metadata
         positions = spec_info.positions
-        c4_positions = getattr(fm, "positions_cmp_padding_c4", None)
-        c128_positions = getattr(fm, "positions_cmp_padding_c128", None)
-        if c4_positions is None or c128_positions is None:
-            return
 
         n_draft = int(spec_info.draft_token_num)
         if not self.needs_cpu_seq_lens:
@@ -5055,12 +5055,14 @@ class DeepseekV4AscendAttnBackend(
                 )
             seq_lens_cpu = seq_lens_cpu + n_draft
 
-        self._fill_verify_positions_cmp_padding_one(
-            positions, c4_positions, 4, seq_lens_cpu, n_draft=n_draft
-        )
-        self._fill_verify_positions_cmp_padding_one(
-            positions, c128_positions, 128, seq_lens_cpu, n_draft=n_draft
-        )
+        for ratio in self._dsv4_unique_compress_ratios:
+            if ratio not in (4, 128):
+                continue
+            dst = getattr(fm, f"positions_cmp_padding_c{ratio}", None)
+            if dst is not None:
+                self._fill_verify_positions_cmp_padding_one(
+                    positions, dst, ratio, seq_lens_cpu, n_draft=n_draft
+                )
 
 
 def _get_kv_indices(

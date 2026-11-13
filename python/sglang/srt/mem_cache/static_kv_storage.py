@@ -899,6 +899,21 @@ def _static_owner_region(token_to_kv_pool) -> Region:
     )
 
 
+def _model_has_request_state_outside_stage(pool) -> bool:
+    """Whether the full model has request-scoped state this PP stage lacks.
+
+    The decode peer runs every layer, so it registers the component; a PP
+    stage whose layers are all ratio 0/1 must still publish an empty one to
+    keep the positional wire order aligned.
+    """
+    stage = set(pool.stage_layer_ids)
+    return any(
+        ratio in (2, 128)
+        for layer_id, ratio in enumerate(pool.compression_ratios)
+        if layer_id not in stage
+    )
+
+
 def _is_dsv4_npu(pool) -> bool:
     from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
         DSV4NPUTokenToKVPool,
@@ -1003,11 +1018,17 @@ def _static_state_entries(
                 router.view(IdSpaceKind.SLIDING_WINDOW), MHATokenToKVPool
             ):
                 swa_kv_layout = router.view(IdSpaceKind.SLIDING_WINDOW).kv_cache_layout
+            swa_layer_ids = (
+                token_to_kv_pool.get_state_layer_ids()
+                if _is_dsv4_npu(token_to_kv_pool)
+                else None
+            )
             add(
                 StateType.SWA,
                 data_ptrs,
                 data_lens,
                 item_lens,
+                layer_ids=swa_layer_ids,
                 kv_layout=swa_kv_layout,
                 # Read when asked, as the window's view was: not every pool
                 # with window state keeps a window pool of its own.
@@ -1050,7 +1071,20 @@ def _static_state_entries(
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
+                        layer_ids=(
+                            token_to_kv_pool.get_request_state_layer_ids()
+                            if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                            else None
+                        ),
                     )
+                elif isinstance(
+                    token_to_kv_pool, DeepSeekV4TokenToKVPool
+                ) and _model_has_request_state_outside_stage(token_to_kv_pool):
+                    # A PP stage that owns no request-scoped layer still
+                    # registers the component: the decode peer has it, and the
+                    # wire order is positional, so omitting it would shift every
+                    # later component (e.g. the draft SWA) by one.
+                    add(StateType.DSV4_REQUEST_STATE, [], [], [])
         elif router.wrapped_view() is not None:
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()
@@ -1214,6 +1248,7 @@ def _static_state_entries(
                 c4_ptrs,
                 c4_lens,
                 c4_item_lens,
+                layer_ids=token_to_kv_pool.get_c4_state_layer_ids(),
             )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same
@@ -1286,11 +1321,18 @@ def _static_state_entries(
             draft_state_type = StateType.SWA
 
         if draft_ptrs:
+            # A PP prefill stage registers only the last stage's draft entries;
+            # the ids keep the PP=1 decode peer from pairing positionally.
             add(
                 draft_state_type,
                 draft_ptrs,
                 draft_lens,
                 draft_item_lens,
+                layer_ids=(
+                    draft_token_to_kv_pool.get_state_layer_ids()
+                    if _is_dsv4_npu(draft_token_to_kv_pool)
+                    else None
+                ),
             )
         row_ptrs, row_lens, row_item_lens = (
             draft_token_to_kv_pool.get_swa_valid_from_buf_infos()
