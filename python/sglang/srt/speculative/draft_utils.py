@@ -418,13 +418,16 @@ class DraftBackendFactory:
     def _create_dsv4_decode_backend(self):
         # Decode here is the EAGLE multi-step draft decode path.
         if is_npu():
-            from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
-                DeepseekV4AscendMultiStepDraftBackend,
-            )
+            from sglang.srt.platforms import current_platform
 
+            backend_cls = current_platform.get_dsv4_draft_backend_cls()
+            if backend_cls is None:
+                from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+                    DeepseekV4AscendMultiStepDraftBackend as backend_cls,
+                )
             return (
                 "dsv4",
-                DeepseekV4AscendMultiStepDraftBackend(
+                backend_cls(
                     self.draft_model_runner, self.topk, self.speculative_num_steps
                 ),
             )

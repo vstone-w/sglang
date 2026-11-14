@@ -5,7 +5,18 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch_npu
-from sgl_kernel_npu.operators.attention import attention_sinks, attention_sinks_prefill
+try:
+    from sgl_kernel_npu.operators.attention import (
+        attention_sinks,
+        attention_sinks_prefill,
+    )
+except ImportError:
+    # The A3-validated wheels export the same wrappers under
+    # sgl_kernel_npu.attention.sinks_attention.
+    from sgl_kernel_npu.attention.sinks_attention import (
+        attention_sinks_triton as attention_sinks,
+        attention_sinks_prefill_triton as attention_sinks_prefill,
+    )
 
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.dllm.config import DllmConfig
@@ -700,7 +711,9 @@ class AscendAttnBackend(AttentionBackend):
                 ][:, :: self.page_size]
                 // self.page_size
             )
-            if self.is_hybrid_swa:
+            # Encoder replay keeps SWA in the request window, so the paged
+            # full-to-SWA mapping does not exist.
+            if self.is_hybrid_swa and self.full_to_swa_index_mapping is not None:
                 self.forward_metadata.block_tables_swa = (
                     (
                         self.full_to_swa_index_mapping[
@@ -1279,7 +1292,7 @@ class AscendAttnBackend(AttentionBackend):
             max_len = attention_kv_lens_cpu.max().item()
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
 
-            if self.is_hybrid_swa:
+            if self.is_hybrid_swa and self.full_to_swa_index_mapping is not None:
                 full_page_locs = self.req_to_token[
                     req_pool_indices[:bs],
                     0 : max_len : self.page_size,

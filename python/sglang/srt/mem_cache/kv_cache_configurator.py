@@ -2239,7 +2239,7 @@ class KVCacheConfigurator:
             unified_fp8=unified_fp8,
             kv_source_layers=kv_source_layers,
             full_size=full_max_total_num_tokens,
-            **({"is_draft_worker": self.is_draft_worker} if not _is_npu else {}),
+            is_draft_worker=self.is_draft_worker,
             **kv_layout_kwargs,
         )
         if not self.is_draft_worker:
@@ -3102,12 +3102,19 @@ class KVCacheConfigurator:
         # Initialize token_to_kv_pool_allocator
         need_sort = get_disagg().disaggregation_mode in ("decode", "prefill")
         if token_to_kv_pool_allocator is None:
+            # Encoder replay moves SWA into the request window, so the pool no
+            # longer has an SWA side: an SWA allocator with size 0 reports
+            # available_size() == 0 and no prefill can ever be admitted.
+            effective_hybrid_swa = self.is_hybrid_swa and not (
+                isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                and not token_to_kv_pool.needs_paged_swa_allocator
+            )
             if _is_npu and (
                 get_exec().kernel.attention_backend == "ascend"
                 or is_compressed_kv_model
                 or self.hybrid_gdn_config is not None
             ):
-                if self.is_hybrid_swa:
+                if effective_hybrid_swa:
                     # DSV4 on NPU: SWA allocator subclass that also drives the
                     # c4/c128 allocators, producing a DSV4OutCacheLoc per alloc.
                     # V4.1 (compress_ratios 1/2) is excluded: its compressed
