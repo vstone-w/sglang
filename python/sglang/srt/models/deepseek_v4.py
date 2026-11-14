@@ -213,6 +213,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     image_token_types,
     materialize_image_gpu,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -1242,13 +1243,11 @@ class MqaAttentionBase(nn.Module):
         if self.attn_tp_size == 1:
             return self.n_local_heads
 
-        if _is_npu and self.is_dsv41:
-            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
-            # A3 BF16 SMLA accepts the per-rank width (e.g. TP16/DP8: 32).
-            # The A5 mixed-quant kernel retains its existing 64-head padding.
-            if not is_npu_arch35():
-                return self.n_local_heads
+        # Platform kernels that widen or narrow the per-rank query width own
+        # that decision in one place (A3 BF16 SMLA vs A5 mixed-quant).
+        platform_heads = current_platform.dsv4_kernel_num_heads(self, num_tokens)
+        if platform_heads is not None:
+            return platform_heads
 
         if get_platform().is_sm120:
             # Prefill already accepts the native per-rank query width.
@@ -4170,6 +4169,7 @@ class DeepseekV4Model(nn.Module):
         dspark_aux_hidden_states: Optional[AuxHiddenStatePacker],
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
+        attn_backend = get_attn_backend()
         hash_ids = None
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
@@ -4206,9 +4206,13 @@ class DeepseekV4Model(nn.Module):
             self.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            attn_backend = get_attn_backend()
-            tail = attn_backend.tail_forward_metadata.late_layer_tail
-            self._check_late_layer_tail_readers(forward_batch, tail)
+            # The backend may fall back to a full extend for this batch (no
+            # request window and a non-zero window floor); it then publishes no
+            # tail metadata and the late layers run every row.
+            tail_metadata = get_attn_backend().tail_forward_metadata
+            if tail_metadata is not None:
+                tail = tail_metadata.late_layer_tail
+                self._check_late_layer_tail_readers(forward_batch, tail)
         tail_in_graph = (
             tail is not None
             and tail.scatter_indices is not None
@@ -5116,9 +5120,11 @@ class DeepseekV4ForCausalLM(
         ):
             return CPLogitsInputs(input_ids, forward_batch)
 
-        tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+        tail_metadata = get_attn_backend().tail_forward_metadata
+        tail = None if tail_metadata is None else tail_metadata.late_layer_tail
         if tail is None:
-            raise RuntimeError("CP bounded-tail logits require prepared tail metadata")
+            # Full-extend fallback: every row is already in the logits layout.
+            return CPLogitsInputs(input_ids, forward_batch)
         logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
         logits_metadata.extend_seq_lens = tail.extend_seq_lens
         logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
@@ -5184,7 +5190,12 @@ class DeepseekV4ForCausalLM(
             and self.model.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            return get_attn_backend().tail_forward_metadata.late_layer_tail
+            # A full-extend fallback publishes no tail metadata: hidden states
+            # are already in the plain row layout.
+            tail_metadata = get_attn_backend().tail_forward_metadata
+            if tail_metadata is None:
+                return None
+            return tail_metadata.late_layer_tail
         return None
 
     def postprocess_cp_output(self, hidden_states, forward_batch):

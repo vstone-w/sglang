@@ -110,3 +110,12 @@ class CudaSRTPlatform(CudaDeviceMixin, SRTPlatform):
         hicache_device_kernels=True,
         supports_pynccl=True,
     )
+
+    def supports_decoder_swa_bounded_replay(self, *, model_type: str) -> bool:
+        return model_type == "deepseek_v41"
+
+    def supports_encoder_swa_bounded_replay(self, *, model_type: str) -> bool:
+        return model_type == "deepseek_v41"
+
+    def decoder_replay_dp_moe_backends(self) -> tuple[str, ...]:
+        return ("none", "megamoe")

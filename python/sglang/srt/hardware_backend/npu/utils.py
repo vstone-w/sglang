@@ -24,6 +24,35 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 indexer_weight_stream = None
 gva_is_inited = False
+_hccp_initialized = False
+
+
+def ensure_hccp_initialized(*, device: torch.device, group=None) -> None:
+    """Initialize HCCP before the first custom AICPU metadata kernel.
+
+    On affected CANN/driver stacks, starting HCCP after a custom AICPU kernel
+    has been dispatched invalidates its dispatch table and fails with 507018.
+    The first caller on each rank performs one TP all-reduce; later calls no-op.
+    """
+    global _hccp_initialized
+    if _hccp_initialized:
+        return
+    device = torch.device(device)
+    if (
+        device.type != "npu"
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+    ):
+        return
+    if group is None:
+        from sglang.srt.runtime_context import get_parallel
+
+        group = get_parallel().tp_group
+    if group is not None and group.world_size > 1 and group.device_group is not None:
+        warmup = torch.zeros(1, device=device)
+        torch.distributed.all_reduce(warmup, group=group.device_group)
+        torch.get_device_module(device.type).synchronize()
+    _hccp_initialized = True
 
 
 @functools.lru_cache(maxsize=1)
@@ -245,41 +274,6 @@ def set_default_server_args(args: "ServerArgs"):
             )
 
 
-def _patch_npu_seed_trace_rules():
-    """Keep aliased CUDA/NPU seed functions consistent with Dynamo's RNG rules."""
-    try:
-        from torch._dynamo import trace_rules
-        from torch._dynamo.variables import (
-            SkipFunctionVariable,
-            TorchInGraphFunctionVariable,
-        )
-        from torch_npu.dynamo.trace_rule import (
-            torch_non_c_binding_in_graph_functions_npu as npu_rules,
-        )
-    except ImportError:
-        # Older torch_npu releases do not register aliases through this rule map.
-        return
-
-    changed = False
-    for name in ("manual_seed", "manual_seed_all"):
-        npu_name = f"torch.npu.random.{name}"
-        if npu_rules.get(npu_name) is TorchInGraphFunctionVariable and any(
-            trace_rules.manual_torch_name_rule_map.get(f"{prefix}.{name}")
-            is SkipFunctionVariable
-            and getattr(module, name) is getattr(torch.npu.random, name)
-            for prefix, module in (
-                ("torch.cuda", torch.cuda),
-                ("torch.cuda.random", torch.cuda.random),
-            )
-        ):
-            # CUDA's top-level and random entries may alias different functions.
-            # Patch the source dict to also cover lazy NPU rule registration.
-            npu_rules[npu_name] = SkipFunctionVariable
-            changed = True
-    if changed:
-        trace_rules.clear_lru_cache()
-
-
 @_call_once
 def init_npu_backend():
     """
@@ -289,28 +283,30 @@ def init_npu_backend():
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
     try:
+        import custom_ops  # noqa: F401
         import sgl_kernel_npu  # noqa: F401
     except ImportError as e:
-        logger.warning("NPU sgl-kernel-npu package unavailable: %s", e)
+        logger.warning("NPU custom kernel packages unavailable: %s", e)
+
+    if is_npu_arch35():
+        try:
+            # A5 mHC still uses the standalone extension. A3 uses bundled
+            # bindings; importing the standalone package can register
+            # conflicting ops.
+            import cann_ops_transformer  # noqa: F401
+        except ImportError as e:
+            logger.warning(
+                "cann_ops_transformer unavailable; DeepSeek-V4.1 NPU operators "
+                "will not be registered: %s",
+                e,
+            )
 
     import torch_npu
-
-    def register_dsv41_vendor_ops():
-        if is_npu_arch35():
-            try:
-                import cann_ops_transformer  # noqa: F401
-            except ImportError as e:
-                logger.warning("DeepSeek-V4.1 A5 operator extension unavailable: %s", e)
-
-    # Select A5's vendor bindings after device selection. A3 uses sgl-kernel-npu.
-    torch_npu.npu._lazy_call(register_dsv41_vendor_ops)
 
     # These imports lead to unpredictable behavior in diffusion models
     # and a significant reduction in performance.
     if "sglang.multimodal_gen" not in sys.modules:
         from torch_npu.contrib import transfer_to_npu  # noqa: F401
-
-        _patch_npu_seed_trace_rules()
 
         # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
         torch.cuda.is_available = lambda: False

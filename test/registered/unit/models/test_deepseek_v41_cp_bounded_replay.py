@@ -428,7 +428,13 @@ class TestCpBoundedReplayConfiguration(CustomTestCase):
                     deepseek_v4_hook,
                     "model_config_of",
                     return_value=SimpleNamespace(
-                        hf_config=SimpleNamespace(model_type="deepseek_v41")
+                        hf_config=SimpleNamespace(
+                            model_type="deepseek_v41",
+                            kv_source_layer_ids=[3],
+                            index_source_layer_ids=[3],
+                            candidate_source_layer_id=-1,
+                            compress_ratios=[0, 0, 0, 1],
+                        )
                     ),
                 ),
                 mock.patch(

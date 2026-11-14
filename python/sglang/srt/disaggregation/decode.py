@@ -761,6 +761,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         return {name: tails.get(name, max(seq_len, 0)) for name in names}
 
+    def _window_single_req_cap(
+        self, name: str, *, retained: Dict[str, int], page_size: int
+    ) -> int:
+        """Slots one request's decode can occupy in ``name``'s window; 0 = unbounded.
+
+        Decode evicts tokens that slide out of the window, so the footprint is
+        bounded by the window plus one eviction interval and one decode
+        allocation -- not by the request's ``max_new_tokens``.
+        """
+        window = retained.get(name)
+        if not window:
+            return 0
+        from sglang.srt.model_executor.pool_configurator import (
+            swa_per_request_tokens,
+        )
+
+        return swa_per_request_tokens(page_size=page_size, window=window)
+
     def _prealloc_demand(
         self,
         req: Req,
@@ -1876,16 +1894,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     CLIP_MAX_NEW_TOKEN,
                 )
                 # Each window grows by the request's decode until it is full,
-                # as the scheduler's window budgets price it.
-                window_admission_tokens = {
-                    name: max(
-                        required,
-                        window_lens[name]
-                        + max_new_tokens
-                        - (retractable_window_tokens or {}).get(name, 0),
+                # as the scheduler's window budgets price it. A request's
+                # footprint is bounded by its container (window + one eviction
+                # interval + one decode allocation), so cap the linear term.
+                page_size = self.token_to_kv_pool_allocator.page_size
+                retained = self._storage().retained_window_lengths()
+                window_admission_tokens = {}
+                for name, required in window_required.items():
+                    need = window_lens[name] + max_new_tokens
+                    cap = self._window_single_req_cap(
+                        name, retained=retained, page_size=page_size
                     )
-                    for name, required in window_required.items()
-                }
+                    if cap > 0:
+                        need = min(need, cap)
+                    window_admission_tokens[name] = max(
+                        required,
+                        need - (retractable_window_tokens or {}).get(name, 0),
+                    )
 
             state_slots = self._pending_state_slots(decode_req.req)
             if not self._prealloc_reservation_fits(
@@ -2878,9 +2903,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     max_new = min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
                     tails = self._window_tails(len(x.origin_input_ids))
                     for name, tail in tails.items():
+                        need = tail + max_new
+                        cap = self._window_single_req_cap(
+                            name, retained=retained, page_size=allocator.page_size
+                        )
+                        if cap > 0:
+                            need = min(need, cap)
                         max_window_req_tokens[name] = max(
-                            max_window_req_tokens.get(name, tail + max_new),
-                            tail + max_new,
+                            max_window_req_tokens.get(name, need),
+                            need,
                         )
                 if stats is not None:
                     stats.max_window_req_tokens = max_window_req_tokens

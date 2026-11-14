@@ -157,6 +157,10 @@ class DecoderReplayTail:
 
     @classmethod
     def maybe_create(cls, model: torch.nn.Module) -> Optional[DecoderReplayTail]:
+        return cls.maybe_create_cuda(model)
+
+    @classmethod
+    def maybe_create_cuda(cls, model: torch.nn.Module) -> Optional[DecoderReplayTail]:
         max_rows = envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
         if not (
             model.tail_writes_source_kv

@@ -1092,14 +1092,13 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
 
-def compute_swa_request_cap(
-    *,
-    page_size: int,
-    window: int,
-    attn_dp_size: int,
-    max_running_requests: int | None = None,
-) -> int:
-    """Worst-case SWA slots the scheduler holds live at max_running_requests."""
+def swa_per_request_tokens(*, page_size: int, window: int) -> int:
+    """Worst-case SWA slots one request holds live at any point in decode.
+
+    Decode evicts tokens that slide out of the window, so the footprint is
+    bounded by the window plus one eviction interval and one decode
+    allocation -- not by the request's whole output budget.
+    """
     draft_tokens = get_spec().speculative_num_draft_tokens or 1
     eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
 
@@ -1120,7 +1119,18 @@ def compute_swa_request_cap(
         # spec-v2: the overlap allocator keeps 2 * alloc_len outstanding
         # (eagle_utils.eagle_prepare_for_decode: kv_committed_len + 2 * alloc_len).
         decode_alloc = 2 * get_alloc_len_per_decode()
-    per_request = trailing_tokens + decode_alloc
+    return trailing_tokens + decode_alloc
+
+
+def compute_swa_request_cap(
+    *,
+    page_size: int,
+    window: int,
+    attn_dp_size: int,
+    max_running_requests: int | None = None,
+) -> int:
+    """Worst-case SWA slots the scheduler holds live at max_running_requests."""
+    per_request = swa_per_request_tokens(page_size=page_size, window=window)
 
     if max_running_requests is None:
         max_running_requests = get_schedule().max_running_requests
@@ -1232,18 +1242,18 @@ class _DSV4PoolSizes:
 
 
 class DSV4PoolConfigurator(MemoryPoolConfigurator):
-    """DSV4 compressed attention budgets, including speculative draft storage.
-
-    The bias covers request-scoped pools that do not scale with full tokens.
-    """
+    """DSV4 compressed attention: coeff is bytes_per_full_token, inflated by (T+D)/T
+    for a draft worker; bias is the request-scoped pools that do not scale with it."""
 
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
+    # A3 keeps V4.1's window and low-ratio rows in BF16 and prices the DSpark
+    # draft's paged SWA exactly; both only exist on arch22.
     _npu_low_ratio_bf16 = False
+    _npu_dspark_draft_layers = 0
     # A subclass that adds the draft's KV to the per-token bytes itself sets this,
     # replacing the (T+D)/T inflation.
     _draft_kv_priced_exactly = False
-    _npu_dspark_draft_layers = 0
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
@@ -1252,10 +1262,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
         self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        if _is_npu:
-            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+        from sglang.srt.platforms import current_platform
 
-            self._npu_low_ratio_bf16 = not is_npu_arch35() and any(
+        if current_platform.supports_dsv41_bf16_kv_rows():
+            self._npu_low_ratio_bf16 = any(
                 ratio in (1, 2) for ratio in cfg.compress_ratios
             )
         from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
@@ -1455,6 +1465,25 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             self.request_window_bytes = max(
                 self.request_window_bytes, window_spec.nbytes + draft_ring_bytes
             )
+            from sglang.srt.platforms import current_platform
+
+            exact_window_bytes = current_platform.request_window_nbytes(
+                num_slots=request_slots,
+                layers=layers,
+                page_size=self.page_size,
+                capacity=(
+                    self.sliding_window_size + self.online_c128_mtp_max_draft_tokens
+                ),
+                workspace_rows=window_spec.workspace_rows,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                draft_ring_size=draft_ring_size,
+                draft_ring_layers=draft_ring_layers,
+            )
+            if exact_window_bytes is not None:
+                self.request_window_bytes = max(
+                    self.request_window_bytes, exact_window_bytes
+                )
             if not self.paged_draft_layers:
                 self.swa_ratio = 0
         self.swa_prefix_tails = self._resolve_swa_prefix_tails()
