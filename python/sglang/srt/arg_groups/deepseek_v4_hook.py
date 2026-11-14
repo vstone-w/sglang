@@ -28,7 +28,7 @@ from sglang.srt.runtime_context import (
     derive_attn_tp_size,
     get_platform,
 )
-from sglang.srt.utils.device import is_gfx95_supported, is_npu
+from sglang.srt.utils.device import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -311,6 +311,33 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
         )
 
 
+def _validate_decoder_swa_bounded_replay_config(server_args: ServerArgs) -> None:
+    hf = model_config_of(server_args).hf_config
+    kv_sources = list(hf.kv_source_layer_ids)
+    if not kv_sources:
+        raise ValueError(
+            "decoder SWA bounded replay requires kv_source_layer_ids in the "
+            "model config"
+        )
+    last_source = max(kv_sources)
+    if last_source not in hf.index_source_layer_ids:
+        raise ValueError(
+            "decoder SWA bounded replay requires the last kv_source layer to be "
+            "an index source"
+        )
+    if hf.candidate_source_layer_id not in (-1, last_source):
+        raise ValueError(
+            "decoder SWA bounded replay requires candidate_source_layer_id to be "
+            "-1 or the last kv_source layer"
+        )
+    ratios = hf.compress_ratios
+    if last_source >= len(ratios) or ratios[last_source] not in (1, 2):
+        raise ValueError(
+            "decoder SWA bounded replay requires the last kv_source layer to "
+            "compress 1:1 or 2:1"
+        )
+
+
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_triton,
@@ -323,6 +350,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+    from sglang.srt.platforms import current_platform
+
     if (
         cfg.dsv4_attn_backend == "trtllm"
         and cfg.cuda_graph_config.prefill.backend
@@ -333,12 +362,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             "disabled or breakable"
         )
     if cfg.enable_encoder_swa_bounded_replay:
+        current_platform.validate_encoder_swa_bounded_replay_args(cfg)
+
         incompatible = (
             (
-                "hardware other than CUDA or gfx950",
-                not (
-                    get_platform().is_cuda
-                    or (get_platform().is_hip and is_gfx95_supported())
+                "a platform without encoder SWA bounded replay support",
+                not current_platform.supports_encoder_swa_bounded_replay(
+                    model_type="deepseek_v41"
                 ),
             ),
             (
@@ -410,7 +440,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-            or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl", "mori")
+            or cfg.disaggregation_transfer_backend
+            not in ("mooncake", "nixl", "mori", "ascend")
             or (
                 (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
                 and not supported_prefill_cp
@@ -419,7 +450,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, NIXL, "
-                "or MoRI, DCP=1, and CP=1 on decode. Prefill CP requires "
+                "MoRI, or Ascend, DCP=1, and CP=1 on decode. Prefill CP requires "
                 "--enable-prefill-cp with the interleave strategy. "
                 "DP attention is supported when "
                 "both servers use the same block size and target/draft KV layout."
@@ -442,13 +473,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             and not (
                 cfg.attn_dp_size == cfg.tp_size
                 and cfg.attn_cp_size == 1
-                and (
-                    (get_platform().is_hip and cfg.moe_a2a_backend == "none")
-                    or (
-                        get_platform().is_cuda
-                        and cfg.moe_a2a_backend in ("none", "megamoe")
-                    )
-                )
+                and cfg.moe_a2a_backend
+                in current_platform.decoder_replay_dp_moe_backends()
             ),
         ),
     )
@@ -459,6 +485,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                     "--enable-decoder-swa-bounded-replay cannot be combined with "
                     f"{feature} yet; disable one of them."
                 )
+        if not current_platform.supports_decoder_swa_bounded_replay(
+            model_type="deepseek_v41"
+        ):
+            raise ValueError(
+                "--enable-decoder-swa-bounded-replay is not supported on this "
+                "platform yet"
+            )
+        _validate_decoder_swa_bounded_replay_config(server_args)
         return
 
     if cfg.enable_decoder_swa_bounded_replay is False:
@@ -478,4 +512,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         "validate_deepseek_v41_features",
         enable_decoder_swa_bounded_replay=enabled,
     )
+    if enabled:
+        _validate_decoder_swa_bounded_replay_config(server_args)
     logger.info("DeepSeek-V4.1 decoder SWA bounded replay resolved to %s", enabled)

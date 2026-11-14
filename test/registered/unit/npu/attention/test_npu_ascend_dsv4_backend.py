@@ -852,6 +852,8 @@ class TestSparseAttentionMetadata(unittest.TestCase):
             backend._dsv4_head_dim = 512
             backend._dsv4_has_c4 = False
             backend._dsv4_has_c128 = False
+            # The bounded-replay draft path reads the pool's optional ring size.
+            backend.token_to_kv_pool = SimpleNamespace(swa_req_ring_size=None)
 
             forward_batch = SimpleNamespace(
                 spec_info=SimpleNamespace(draft_token_num=2),

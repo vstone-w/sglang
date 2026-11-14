@@ -281,6 +281,77 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform supports a draft backend for an algorithm."""
         return False
 
+    # ------------------------------------------------------------------
+    # DeepSeek-V4.1 SWA bounded replay (safe conservative defaults)
+    # ------------------------------------------------------------------
+
+    def supports_decoder_swa_bounded_replay(self, *, model_type: str) -> bool:
+        """Whether this platform can run decoder SWA bounded replay for ``model_type``."""
+        return False
+
+    def supports_encoder_swa_bounded_replay(self, *, model_type: str) -> bool:
+        """Whether this platform can run encoder SWA bounded replay for ``model_type``."""
+        return False
+
+    def decoder_replay_dp_moe_backends(self) -> tuple[str, ...]:
+        """MoE all-to-all backends that admit decoder replay's DP attention shape."""
+        return ()
+
+    def create_decoder_replay_tail(self, model: Any) -> Optional[Any]:
+        """Build this platform's decoder late-layer tail runner, or ``None``.
+
+        The returned object must provide ``plan``, ``run``, ``run_idle`` and
+        ``breaks_out_of_prefill_graph``; the model treats it as the shared
+        ``DecoderReplayTail`` protocol. ``None`` keeps the tail eager.
+        """
+        return None
+
+    def validate_encoder_swa_bounded_replay_args(self, cfg: Any) -> None:
+        """Raise when this platform cannot honor the encoder replay config."""
+        return None
+
+    def get_dsv4_attention_backend_cls(self) -> Optional[type]:
+        """Return this platform's DeepSeek-V4 attention backend class, or None.
+
+        ``None`` keeps the in-tree selection (the Ascend DSV4 backend on NPU).
+        A platform whose backend differs by hardware generation returns the
+        class for the current device; the registry constructs it with the model
+        runner.
+        """
+        return None
+
+    def get_dsv4_draft_backend_cls(self) -> Optional[type]:
+        """Return this platform's DeepSeek-V4 multi-step draft backend, or None."""
+        return None
+
+    def supports_dsv41_bf16_kv_rows(self) -> bool:
+        """Whether V4.1 window/compressed rows are stored unquantized BF16."""
+        return False
+
+    def dsv4_kernel_num_heads(self, layer: Any, num_tokens: int) -> Optional[int]:
+        """Override a V4 attention layer's kernel head width, or None.
+
+        Returning ``None`` keeps the model's own padding rule. A platform whose
+        kernels accept the native per-rank width returns that width.
+        """
+        return None
+
+    def request_window_nbytes(
+        self,
+        *,
+        num_slots: int,
+        layers: int,
+        page_size: int,
+        capacity: int,
+        workspace_rows: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        draft_ring_size: int,
+        draft_ring_layers: int,
+    ) -> Optional[int]:
+        """Exact request-window bytes for this platform's row format, or None."""
+        return None
+
     def support_mamba_cache_extra_buffer(self) -> bool:
         """Whether this out-of-tree platform supports Mamba cache snapshots."""
         return False

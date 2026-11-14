@@ -1,0 +1,910 @@
+"""NPU decoder late-layer tail row-bucket graphs.
+
+The layers after ``late_layer_start`` only run each request's last ``SWA_WINDOW``
+rows.  On NPU there is no breakable graph, so a bucket captures the whole layer
+stack as one ``torch.npu.NPUGraph`` and every per-step value is copied into
+graph-owned buffers before replay:
+
+* the attention metadata is rebuilt outside the graph (the A3 AICPU metadata
+  kernel cannot run inside a capture session) and copied field by field into
+  the captured object;
+* the mHC state leaves, positions, ids and row counts are copied into static
+  buffers;
+* the graph itself is replayed without any eager break.
+
+The graph key includes the padded request count: one row bucket can hold a
+different request mix on another step. Under attention DP every rank agrees
+on that count before capturing, so capture barriers stay symmetric. The MoE
+must be capturable (DeepEP low-latency within its token capacity). Encoder
+request windows, rows past the bucket limit, and other unsupported shapes
+return ``False`` from ``plan`` and stay on the eager model loop.
+"""
+
+from __future__ import annotations
+
+import copy
+import logging
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+import torch
+
+from sglang.srt.distributed.utils import all_gather_single
+from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import (
+    ensure_hccp_initialized,
+    is_npu_arch35,
+)
+from sglang.srt.layers.attention.dsv4.late_layer_tail import (
+    SWA_WINDOW,
+    late_layer_whole_extend,
+)
+from sglang.srt.layers.dp_attention import (
+    get_is_extend_in_batch,
+    set_is_extend_in_batch,
+)
+from sglang.srt.layers.moe import get_deepep_mode, get_moe_a2a_backend
+from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
+    enter_late_layer_dp,
+    exit_late_layer_dp,
+)
+from sglang.srt.models.deepseek_v4_mhc import HcState
+from sglang.srt.runtime_context import get_parallel
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
+
+# Batch tensors whose values change every tail step and therefore must live in
+# graph-owned storage.  CPU mirrors are rebuilt outside the graph by the
+# metadata refresh and stay fixed on the capture batch.
+# ``input_ids`` / ``input_ids_global`` / ``positions`` are the tail rows the
+# model passes to ``run``, not the full-extend batch fields; they get dedicated
+# buffers below.  Copying the batch's full-extend ids here would feed the
+# captured layers the wrong rows (and its padding changes with DSpark).
+_BATCH_TENSOR_FIELDS = (
+    "out_cache_loc",
+    "req_pool_indices",
+    "seq_lens",
+    "extend_seq_lens",
+    "extend_prefix_lens",
+    "extend_start_loc",
+    "num_token_non_padded",
+    "global_num_token_non_padded",
+)
+# Row counts are owned by the bucket, not by the live (full-extend) batch: the
+# MoE must mask at SWA_WINDOW even though the batch still carries the extend's
+# counts.  They are allocated above but never copied from the live batch.
+_COUNT_FIELDS = ("num_token_non_padded", "global_num_token_non_padded")
+_BATCH_LIVE_FIELDS = tuple(
+    name for name in _BATCH_TENSOR_FIELDS if name not in _COUNT_FIELDS
+)
+
+
+def _is_tensor(value) -> bool:
+    return torch.is_tensor(value)
+
+
+def _flatten_state(state: HcState) -> Tuple[List[torch.Tensor], bool]:
+    """The state leaves the graph carries.  The normed input and mix stats are
+    dropped: the first tail layer's combine rebuilds them, exactly as the CUDA
+    tail runner does."""
+    assert isinstance(state.streams, torch.Tensor), "tail graphs need mHC rows"
+    if state.pre is None:
+        return [state.streams], False
+    return [state.streams, state.pre], True
+
+
+def _rebuild_state(leaves: List[torch.Tensor], has_pre: bool) -> HcState:
+    return HcState(leaves[0], leaves[1] if has_pre else None)
+
+
+@contextmanager
+def _low_latency_moe_dispatch():
+    """Force the EP dispatcher onto its low-latency implementation.
+
+    The tail is an extend step, so AUTO mode would pick DeepEP's normal
+    dispatch, whose internal stream synchronize is not capturable.  The
+    low-latency path is the one decode/verify graphs already capture; the
+    bucket fixes every rank at SWA_WINDOW rows, well inside its 256-row bound.
+    """
+    saved = get_is_extend_in_batch()
+    set_is_extend_in_batch(False)
+    try:
+        yield
+    finally:
+        set_is_extend_in_batch(saved)
+
+
+def _clone_value(value):
+    """Deep-copy tensors/dicts/lists; leave scalars and opaque objects alone."""
+    if _is_tensor(value):
+        return value.clone()
+    if isinstance(value, dict):
+        return {k: _clone_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clone_value(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_value(v) for v in value)
+    return value
+
+
+def _copy_value(dst, src, *, name: str) -> None:
+    """Copy a refreshed metadata/batch field into its captured counterpart."""
+    if _is_tensor(src) and _is_tensor(dst):
+        if dst.dtype != src.dtype:
+            raise RuntimeError(
+                f"NPU tail graph field {name!r} changed dtype: "
+                f"captured {dst.dtype}, live {src.dtype}"
+            )
+        if dst.device != src.device:
+            src = src.to(dst.device)
+        if dst.data_ptr() == src.data_ptr() and dst.shape == src.shape:
+            # The metadata builder reuses cached buffers by key and shape; the
+            # fresh field already is the graph-owned tensor.
+            return
+        if dst.untyped_storage().data_ptr() == src.untyped_storage().data_ptr():
+            src = src.clone()
+        if dst.shape == src.shape:
+            dst.copy_(src)
+            return
+        # Page tables and some per-row metadata shrink or grow with the
+        # request's page count.  Captures pad them to the pool's maximum width;
+        # refresh the live prefix and keep the tail zeroed.
+        if dst.dim() == src.dim() and all(
+            d >= s for d, s in zip(dst.shape, src.shape)
+        ):
+            dst.zero_()
+            dst[tuple(slice(0, int(s)) for s in src.shape)].copy_(src)
+            return
+        raise RuntimeError(
+            f"NPU tail graph field {name!r} grew past its captured shape: "
+            f"captured {tuple(dst.shape)}/{dst.dtype}, "
+            f"live {tuple(src.shape)}/{src.dtype}"
+        )
+    if isinstance(src, dict) and isinstance(dst, dict):
+        for key in src:
+            if key in dst:
+                _copy_value(dst[key], src[key], name=f"{name}[{key}]")
+        return
+    if isinstance(src, (list, tuple)) and isinstance(dst, (list, tuple)):
+        if len(src) != len(dst):
+            raise RuntimeError(
+                f"NPU tail graph field {name!r} changed length: "
+                f"captured {len(dst)}, live {len(src)}"
+            )
+        for i, (d, s) in enumerate(zip(dst, src)):
+            _copy_value(d, s, name=f"{name}[{i}]")
+        return
+    # msgspec Structs (``LateLayerTail`` and nested metadata) expose their
+    # fields through ``__struct_fields__``; copy the tensor fields in place.
+    fields = getattr(src, "__struct_fields__", None)
+    if fields is not None and getattr(dst, "__struct_fields__", None) is not None:
+        for field in fields:
+            if hasattr(dst, field):
+                _copy_value(
+                    getattr(dst, field),
+                    getattr(src, field),
+                    name=f"{name}.{field}" if name else field,
+                )
+        return
+
+
+def _clone_metadata(metadata):
+    clone = copy.copy(metadata)
+    for name, value in vars(metadata).items():
+        setattr(clone, name, _clone_value(value))
+    return clone
+
+
+def _copy_metadata(dst, src) -> None:
+    for name, value in vars(src).items():
+        if not hasattr(dst, name):
+            continue
+        _copy_value(getattr(dst, name), value, name=name)
+
+
+def _pad_metadata_tables(metadata, backend) -> None:
+    """Widen the captured page tables to the pool's maximum page count.
+
+    A tail step's page count follows its sequence length, and DSpark's draft
+    padding makes it change between the capture step and later replays.  The
+    attention operators bound their reads by ``seqused``, so the live prefix of
+    a wider table is enough; capture must own the wider buffer.
+    """
+    req_to_token = getattr(backend, "req_to_token", None)
+    page_size = int(getattr(backend, "page_size", 0) or 0)
+    if not _is_tensor(req_to_token) or page_size <= 0:
+        return
+    max_pages = (int(req_to_token.shape[1]) + page_size - 1) // page_size
+    # Every page table (SWA, full, and the ratio c1/c2/c4/c128 state/index
+    # variants) grows with the sequence's page count.
+    names = [
+        name
+        for name in vars(metadata)
+        if name.endswith("_page_table") or name in ("block_tables", "block_tables_swa")
+    ]
+    for name in names:
+        table = getattr(metadata, name, None)
+        if _is_tensor(table) and table.dim() == 2 and table.shape[1] < max_pages:
+            padded = torch.zeros(
+                (table.shape[0], max_pages), dtype=table.dtype, device=table.device
+            )
+            padded[:, : table.shape[1]].copy_(table)
+            setattr(metadata, name, padded)
+
+
+class _NpuTailGraph:
+    __slots__ = (
+        "graph",
+        "batch",
+        "metadata",
+        "leaves",
+        "outputs",
+        "has_pre",
+        "dp_rows",
+    )
+
+    def __init__(self, graph, batch, metadata, leaves, outputs, has_pre, dp_rows):
+        self.graph = graph
+        self.batch = batch
+        self.metadata = metadata
+        self.leaves = leaves
+        self.outputs = outputs
+        self.has_pre = has_pre
+        self.dp_rows = dp_rows
+
+
+class NpuDecoderReplayTail:
+    """Row-bucket ``NPUGraph`` for the decoder late-layer stack."""
+
+    _graph_pool = None
+
+    def __init__(
+        self,
+        *,
+        model: torch.nn.Module,
+        layer_ids: range,
+        row_step: int,
+        max_rows: int,
+    ) -> None:
+        self._model = model
+        self._layer_ids = layer_ids
+        self._row_step = row_step
+        self._max_rows = max_rows - max_rows % row_step
+        self._graphs: dict[tuple, _NpuTailGraph] = {}
+        self._disabled = False
+        self.capture_seconds = 0.0
+
+    @classmethod
+    def maybe_create(cls, model: torch.nn.Module) -> Optional[NpuDecoderReplayTail]:
+        max_rows = envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
+        if not (
+            model.tail_writes_source_kv
+            and max_rows > 0
+            # A5 lands with its own metadata ABI.
+            and not is_npu_arch35()
+        ):
+            return None
+        return cls(
+            model=model,
+            layer_ids=range(model.late_layer_start, model.end_layer),
+            row_step=SWA_WINDOW,
+            max_rows=max_rows,
+        )
+
+    # ------------------------------------------------------------------
+    # Model-facing protocol
+    # ------------------------------------------------------------------
+
+    def plan(
+        self,
+        tail: Optional[LateLayerTail],
+        *,
+        forward_batch: ForwardBatch,
+        num_tokens: int,
+        tail_in_graph: bool,
+        late_dp_counts: Optional[List[int]],
+    ) -> Tuple[bool, Optional[List[int]]]:
+        if self._disabled or tail_in_graph:
+            return False, None
+        if getattr(forward_batch, "encoder_swa_row_floor", None) is not None:
+            return False, None
+        pool = get_attn_backend().token_to_kv_pool
+        if getattr(pool, "request_window", None) is not None:
+            return False, None
+        live_lens: List[int] = []
+        if tail is not None:
+            if getattr(tail, "cp_metadata", None) is not None:
+                return False, None
+            tail_lens = getattr(tail, "extend_seq_lens_cpu", None)
+            if tail_lens is None:
+                return False, None
+            live_lens = [int(n) for n in tail_lens]
+            if any(n < 0 for n in live_lens):
+                return False, None
+            if tail.positions.shape[0] != sum(live_lens):
+                return False, None
+        live_rows = sum(live_lens)
+
+        dp = get_parallel().attn_dp_size > 1
+        if dp:
+            dp_rows = self._dp_rows(forward_batch, late_dp_counts)
+            if dp_rows is None or len(dp_rows) != get_parallel().attn_dp_size:
+                return False, None
+            dp_rows = [int(n) for n in dp_rows]
+            if any(n < 0 or n > self._max_rows for n in dp_rows):
+                return False, None
+            if live_rows != dp_rows[get_parallel().attn_dp_rank]:
+                return False, None
+            max_live = max(dp_rows)
+            if max_live == 0:
+                return False, None
+            bucket_rows = -(-max_live // self._row_step) * self._row_step
+            if bucket_rows > self._max_rows:
+                return False, None
+            if not self._moe_can_capture(bucket_rows):
+                return False, None
+            # A graph's metadata shapes are fixed by its padded request count.
+            # Every rank must reach the same count before capturing, or the
+            # capture barriers diverge; ranks that disagree fall back eagerly.
+            if self._dp_padded_bs(self._padded_bs(live_lens, bucket_rows)) is None:
+                return False, None
+            # Idle ranks join the same bucket; missing rows are dead requests.
+            return True, [bucket_rows] * len(dp_rows)
+        if tail is None:
+            return False, None
+        bucket_rows = -(-live_rows // self._row_step) * self._row_step
+        if bucket_rows <= 0 or bucket_rows > self._max_rows:
+            return False, None
+        if not self._moe_can_capture(bucket_rows):
+            return False, None
+        return True, None
+
+    def _padded_bs(self, live_lens: List[int], bucket_rows: int) -> int:
+        """Requests in the padded batch: live ones plus the dummy row chunks."""
+        dummy_rows = bucket_rows - sum(live_lens)
+        return len(live_lens) + len(self._pad_lens(dummy_rows, self._row_step))
+
+    @staticmethod
+    def _dp_padded_bs(padded_bs: int) -> Optional[int]:
+        """The request count every attention-DP rank agrees on, or None."""
+        parallel = get_parallel()
+        if parallel.attn_dp_size != parallel.tp_group.world_size:
+            return None
+        counts = torch.empty(parallel.attn_dp_size, dtype=torch.int64)
+        all_gather_single(
+            counts,
+            torch.tensor([padded_bs], dtype=torch.int64),
+            group=parallel.tp_group.cpu_group,
+        )
+        values = counts.tolist()
+        return values[0] if len(set(values)) == 1 else None
+
+    @staticmethod
+    def _moe_can_capture(rows: int) -> bool:
+        """Whether this MoE transport can replay a segment over ``rows`` rows."""
+        backend = get_moe_a2a_backend()
+        if backend.is_none():
+            return True
+        if backend.is_deepep():
+            mode = get_deepep_mode().resolve(is_extend_in_batch=False)
+            capacity = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        elif backend.is_deepep_v2():
+            mode = get_deepep_mode().resolve(is_extend_in_batch=False)
+            capacity = envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        else:
+            # Other transports have no validated capture path in this runner.
+            return False
+        return mode.is_low_latency() and rows <= capacity
+
+    def breaks_out_of_prefill_graph(
+        self, tail: LateLayerTail, *, num_tokens: int
+    ) -> bool:
+        return False
+
+    def run(
+        self,
+        *,
+        state: HcState,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor,
+        input_ids_global: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        capture_dspark: bool,
+        dp_rows: Optional[List[int]] = None,
+        out_rows: Optional[int] = None,
+    ):
+        expected_dspark = self._model.dspark_layers_to_capture is not None
+        if capture_dspark != expected_dspark:
+            raise RuntimeError(
+                "NPU tail graph capture_dspark does not match the model's "
+                f"dspark_layers_to_capture: {capture_dspark} vs {expected_dspark}"
+            )
+        return self._run(
+            state=state,
+            positions=positions,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+            forward_batch=forward_batch,
+            capture_dspark=capture_dspark,
+            dp_rows=dp_rows,
+            out_rows=out_rows,
+        )
+
+    def run_idle(
+        self,
+        *,
+        state: HcState,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor,
+        input_ids_global: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        capture_dspark: bool,
+        dp_rows: List[int],
+    ):
+        expected_dspark = self._model.dspark_layers_to_capture is not None
+        if capture_dspark != expected_dspark:
+            raise RuntimeError(
+                "NPU tail graph capture_dspark does not match the model's "
+                f"dspark_layers_to_capture: {capture_dspark} vs {expected_dspark}"
+            )
+        return self._run(
+            state=state,
+            positions=positions,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+            forward_batch=forward_batch,
+            capture_dspark=capture_dspark,
+            dp_rows=dp_rows,
+            out_rows=0,
+            tail=None,
+        )
+
+    # ------------------------------------------------------------------
+    # Graph lifecycle
+    # ------------------------------------------------------------------
+
+    def _dp_rows(
+        self,
+        forward_batch: ForwardBatch,
+        late_dp_counts: Optional[List[int]],
+    ) -> Optional[List[int]]:
+        if get_parallel().attn_dp_size == 1:
+            return None
+        rows = forward_batch.global_late_layer_num_tokens_cpu
+        if rows is None:
+            rows = late_dp_counts
+        if rows is None:
+            return None
+        rows = list(rows)
+        if len(rows) != get_parallel().attn_dp_size:
+            return None
+        return rows
+
+    def _run(
+        self,
+        *,
+        state,
+        positions,
+        input_ids,
+        input_ids_global,
+        forward_batch,
+        capture_dspark,
+        dp_rows,
+        out_rows,
+        tail=None,
+    ):
+        backend = get_attn_backend()
+        live_rows = int(positions.shape[0])
+        if tail is None and live_rows > 0:
+            tail = getattr(backend.forward_metadata, "late_layer_tail", None)
+        if dp_rows is not None:
+            bucket_rows = int(dp_rows[0])
+        else:
+            bucket_rows = -(-live_rows // self._row_step) * self._row_step
+        if bucket_rows <= 0:
+            raise RuntimeError("NPU tail graph needs a non-empty row bucket")
+
+        padded_batch, padded_metadata = self._build_padded_tail(
+            backend,
+            forward_batch=forward_batch,
+            tail=tail,
+            positions=positions,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+            bucket_rows=bucket_rows,
+        )
+        leaves, has_pre = _flatten_state(state)
+        padded_leaves = self._pad_leaves(leaves, bucket_rows)
+        # The padded request count fixes the metadata tensor shapes; one row
+        # bucket can carry a different request mix (1x128 vs 2x64).
+        key = (
+            has_pre,
+            dp_rows is not None,
+            capture_dspark,
+            bucket_rows,
+            int(padded_batch.batch_size),
+        )
+        graph = self._graphs.get(key)
+        if graph is None:
+            graph = self._capture(
+                key,
+                padded_batch=padded_batch,
+                padded_metadata=padded_metadata,
+                padded_leaves=padded_leaves,
+                has_pre=has_pre,
+                capture_dspark=capture_dspark,
+                dp_rows=dp_rows,
+            )
+        else:
+            self._refresh(
+                graph,
+                padded_batch=padded_batch,
+                padded_metadata=padded_metadata,
+                padded_leaves=padded_leaves,
+            )
+        residual, pre, aux = graph.outputs
+        cut = live_rows if out_rows is None else out_rows
+        return (
+            residual[:cut],
+            None if pre is None else pre[:cut],
+            [t[:cut] for t in aux],
+        )
+
+    def _pad_leaves(self, leaves, bucket_rows: int):
+        padded = [
+            torch.zeros(
+                (bucket_rows, *t.shape[1:]), dtype=t.dtype, device=t.device
+            )
+            for t in leaves
+        ]
+        for dst, src in zip(padded, leaves):
+            if src.shape[0]:
+                dst[: src.shape[0]].copy_(src)
+        return padded
+
+    @staticmethod
+    def _pad_lens(pad_rows: int, row_step: int) -> List[int]:
+        lens: List[int] = []
+        while pad_rows > 0:
+            n = min(row_step, pad_rows)
+            lens.append(n)
+            pad_rows -= n
+        return lens
+
+    def _build_padded_tail(
+        self,
+        backend,
+        *,
+        forward_batch,
+        tail,
+        positions,
+        input_ids,
+        input_ids_global,
+        bucket_rows: int,
+    ):
+        """Pad the live tail rows with dummy requests to one graph bucket.
+
+        Live rows stay first (in the model's tail order), so the graph outputs
+        can be cut back to ``live_rows``.  A dummy request uses the request
+        pool's reserved slot 0 and a sink SWA row, so it never touches real KV.
+        """
+        live_lens = [] if tail is None else [int(n) for n in tail.extend_seq_lens_cpu]
+        live_rows = sum(live_lens)
+        if live_rows != int(positions.shape[0]):
+            raise RuntimeError(
+                "NPU tail graph live rows disagree with the tail layout: "
+                f"{live_rows} vs {positions.shape[0]}"
+            )
+        real_bs = len(live_lens)
+        dummy_lens = self._pad_lens(bucket_rows - live_rows, self._row_step)
+        dummy_bs = len(dummy_lens)
+        device = positions.device
+
+        seq_cpu = forward_batch.seq_lens_cpu
+        if seq_cpu is None:
+            seq_cpu = forward_batch.seq_lens.cpu().tolist()
+        elif not isinstance(seq_cpu, list):
+            seq_cpu = seq_cpu.tolist()
+        real_seq = [int(n) for n in seq_cpu[:real_bs]]
+
+        def t(values, dtype=torch.int64):
+            return torch.tensor(values, dtype=dtype, device=device)
+
+        def cat(parts, dtype=torch.int64):
+            parts = [p for p in parts if p is not None]
+            if not parts:
+                return torch.empty(0, dtype=dtype, device=device)
+            return torch.cat(parts)
+
+        real_req = forward_batch.req_pool_indices[:real_bs].to(torch.int64)
+        real_out = (
+            tail.full_out_cache_loc.to(torch.int64)
+            if tail is not None and tail.full_out_cache_loc is not None
+            else torch.empty(0, dtype=torch.int64, device=device)
+        )
+        real_pos = positions.to(torch.int64)
+        real_ids = input_ids.to(torch.int64)
+        real_ids_global = (
+            None if input_ids_global is None else input_ids_global.to(torch.int64)
+        )
+        dummy_ids = [torch.arange(n, dtype=torch.int64, device=device) for n in dummy_lens]
+        dummy_pos = cat(dummy_ids, dtype=torch.int64)
+        dummy_req = torch.zeros(dummy_bs, dtype=torch.int64, device=device)
+        dummy_out = torch.zeros(sum(dummy_lens), dtype=torch.int64, device=device)
+        dummy_tokens = torch.zeros(sum(dummy_lens), dtype=torch.int64, device=device)
+
+        whole = late_layer_whole_extend(
+            forward_batch,
+            dspark=self._model.dspark_layers_to_capture is not None,
+        )
+        whole = [False] * real_bs if whole is None else list(whole)
+        logprob_starts = [
+            0 if is_whole else n for n, is_whole in zip(live_lens, whole)
+        ] + list(dummy_lens)
+
+        batch = copy.copy(forward_batch)
+        batch.batch_size = real_bs + dummy_bs
+        # The DP plan exchanged this count before any rank captured; drift
+        # between the two would desynchronize the graph keys.
+        assert batch.batch_size == self._padded_bs(live_lens, bucket_rows)
+        batch.req_pool_indices = cat([real_req, dummy_req], dtype=torch.int64)
+        seq_cpu = real_seq + list(dummy_lens)
+        # Ascend metadata reads seq_lens_cpu.int(); keep it the CPU tensor the
+        # batch normally carries. The per-request list stays extend_seq_lens_cpu.
+        batch.seq_lens_cpu = torch.tensor(seq_cpu, dtype=torch.int64)
+        batch.seq_lens = t(seq_cpu, dtype=torch.int32)
+        batch.extend_seq_lens_cpu = list(live_lens) + list(dummy_lens)
+        batch.extend_seq_lens = t(batch.extend_seq_lens_cpu, dtype=torch.int32)
+        prefix_cpu = [s - n for s, n in zip(real_seq, live_lens)] + [0] * dummy_bs
+        batch.extend_prefix_lens_cpu = prefix_cpu
+        batch.extend_prefix_lens = t(prefix_cpu, dtype=torch.int64)
+        batch.extend_start_loc = (
+            torch.cumsum(batch.extend_seq_lens, 0) - batch.extend_seq_lens
+        ).to(torch.int64)
+        batch.positions = cat([real_pos, dummy_pos], dtype=torch.int64)
+        batch.out_cache_loc = cat([real_out, dummy_out], dtype=torch.int64)
+        batch.input_ids = cat([real_ids, dummy_tokens], dtype=torch.int64)
+        batch.input_ids_global = (
+            None
+            if real_ids_global is None
+            else cat([real_ids_global, dummy_tokens], dtype=torch.int64)
+        )
+        batch.num_token_non_padded = torch.full(
+            (), bucket_rows, dtype=torch.int32, device=device
+        )
+        batch.global_num_token_non_padded = torch.full(
+            (), bucket_rows, dtype=torch.int32, device=device
+        )
+        batch.global_num_token_non_padded_cpu = bucket_rows
+        if hasattr(batch, "num_token_non_padded_cpu"):
+            batch.num_token_non_padded_cpu = bucket_rows
+        if hasattr(batch, "seq_lens_sum"):
+            batch.seq_lens_sum = sum(seq_cpu)
+        batch.forward_mode = ForwardMode.EXTEND
+        batch.spec_info = None
+        batch.is_extend_in_batch = True
+        batch.return_logprob = True
+        batch.extend_logprob_start_lens_cpu = logprob_starts
+        batch.capture_hidden_mode = CaptureHiddenMode.NULL
+        batch.encoder_swa_row_floor = None
+        batch.encoder_swa_compress_rows = None
+
+        metadata = backend._build_late_layer_tail_metadata(batch)
+        if metadata is None:
+            raise RuntimeError("NPU tail graph produced no padded tail metadata")
+        padded_tail = metadata.late_layer_tail
+        if dummy_bs:
+            # Dummy rows borrowed a valid full slot (0) to keep the compressed
+            # metadata in range; their SWA stores must land on the sink row.
+            padded_tail.swa_out_cache_loc[live_rows:].fill_(-1)
+        return batch, metadata
+
+    def _capture(
+        self,
+        key,
+        *,
+        padded_batch,
+        padded_metadata,
+        padded_leaves,
+        has_pre,
+        capture_dspark,
+        dp_rows,
+    ) -> _NpuTailGraph:
+        import time
+
+        start = time.perf_counter()
+        backend = get_attn_backend()
+        device = padded_batch.positions.device
+        ensure_hccp_initialized(device=device)
+
+        static_leaves = [torch.zeros_like(t) for t in padded_leaves]
+        static_batch = self._make_static_batch(
+            padded_batch,
+            padded_batch.positions,
+            padded_batch.input_ids,
+            getattr(padded_batch, "input_ids_global", None),
+        )
+        for dst, src in zip(static_leaves, padded_leaves):
+            dst.copy_(src)
+        self._copy_batch_values(padded_batch, static_batch)
+
+        static_metadata = _clone_metadata(padded_metadata)
+        _pad_metadata_tables(static_metadata, backend)
+        saved_metadata = backend.forward_metadata
+        # The MoE sees a fixed, symmetric DP layout for every replay; the
+        # capture body and the replay below both run under it.
+        saved_dp = (
+            enter_late_layer_dp(static_batch, dp_rows) if dp_rows is not None else None
+        )
+        backend.forward_metadata = static_metadata
+        try:
+            def body():
+                # A fresh state per call: the first layer releases the one it
+                # consumes, and the graph's kernels only need the leaf buffers.
+                return self._layer_stack(
+                    _rebuild_state(static_leaves, has_pre),
+                    positions=static_batch.positions,
+                    input_ids=static_batch.input_ids,
+                    input_ids_global=getattr(
+                        static_batch, "input_ids_global", None
+                    ),
+                    forward_batch=static_batch,
+                    capture_dspark=capture_dspark,
+                )
+
+            tp_group = get_parallel().tp_group
+            with _low_latency_moe_dispatch():
+                for _ in range(2):
+                    torch.npu.synchronize()
+                    tp_group.barrier()
+                    body()
+
+                # Capture on the current stream: the dispatcher's async events
+                # are recorded there, and crossing a separate capture stream
+                # degenerates into a forbidden stream synchronize.
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(
+                    graph,
+                    pool=self._get_graph_pool(),
+                    auto_dispatch_capture=True,
+                    # Low-latency dispatch still copies its token-count
+                    # metadata host->device; global capture mode rejects it.
+                    # The bucket fixes that count, so the captured copy is the
+                    # value every replay needs.
+                    capture_error_mode="relaxed",
+                ):
+                    outputs = body()
+            torch.npu.synchronize()
+        finally:
+            backend.forward_metadata = saved_metadata
+            if saved_dp is not None:
+                exit_late_layer_dp(static_batch, saved_dp)
+
+        record = _NpuTailGraph(
+            graph,
+            static_batch,
+            static_metadata,
+            static_leaves,
+            outputs,
+            has_pre,
+            dp_rows,
+        )
+        self._graphs[key] = record
+        self.capture_seconds += time.perf_counter() - start
+        if get_parallel().tp_rank == 0:
+            logger.info(
+                "NPU decoder tail graph: captured %d rows in %.2f s (%d graphs)",
+                padded_batch.positions.shape[0],
+                self.capture_seconds,
+                len(self._graphs),
+            )
+        return record
+
+    def _refresh(
+        self,
+        graph: _NpuTailGraph,
+        *,
+        padded_batch,
+        padded_metadata,
+        padded_leaves,
+    ) -> None:
+        backend = get_attn_backend()
+        for dst, src in zip(graph.leaves, padded_leaves):
+            dst.copy_(src)
+        self._copy_batch_values(padded_batch, graph.batch)
+        _copy_metadata(graph.metadata, padded_metadata)
+        saved = backend.forward_metadata
+        saved_dp = (
+            enter_late_layer_dp(graph.batch, graph.dp_rows)
+            if graph.dp_rows is not None
+            else None
+        )
+        backend.forward_metadata = graph.metadata
+        try:
+            graph.graph.replay()
+        finally:
+            backend.forward_metadata = saved
+            if saved_dp is not None:
+                exit_late_layer_dp(graph.batch, saved_dp)
+
+    # ------------------------------------------------------------------
+    # Static buffer helpers
+    # ------------------------------------------------------------------
+
+    def _make_static_batch(self, forward_batch, positions, input_ids, input_ids_global):
+        batch = copy.copy(forward_batch)
+        for name in _BATCH_TENSOR_FIELDS:
+            value = getattr(forward_batch, name, None)
+            if _is_tensor(value):
+                setattr(batch, name, torch.zeros_like(value))
+        # The layers read these two as explicit inputs, not through the
+        # per-step batch fields, so they need graph-owned storage too.
+        batch.positions = torch.zeros_like(positions)
+        batch.input_ids = torch.zeros_like(input_ids)
+        if _is_tensor(input_ids_global):
+            batch.input_ids_global = torch.zeros_like(input_ids_global)
+        # Keep the host-side scalar/mirror fields the capture reads; every
+        # replay has the same request count and row count.
+        return batch
+
+    def _copy_batch_values(self, live, static):
+        for name in (*_BATCH_LIVE_FIELDS, "positions", "input_ids"):
+            src = getattr(live, name, None)
+            dst = getattr(static, name, None)
+            if _is_tensor(src) and _is_tensor(dst):
+                _copy_value(dst, src, name=name)
+        src_global = getattr(live, "input_ids_global", None)
+        dst_global = getattr(static, "input_ids_global", None)
+        if _is_tensor(src_global) and _is_tensor(dst_global):
+            dst_global.copy_(src_global)
+        # The bucket owns the MoE row count; the live batch still carries the
+        # full extend's count at the tail switch.
+        rows = int(static.positions.shape[0])
+        for name in _COUNT_FIELDS:
+            count = getattr(static, name, None)
+            if _is_tensor(count):
+                count.fill_(rows)
+
+    def _get_graph_pool(self):
+        if NpuDecoderReplayTail._graph_pool is None:
+            NpuDecoderReplayTail._graph_pool = torch.npu.graph_pool_handle()
+        return NpuDecoderReplayTail._graph_pool
+
+    def _layer_stack(
+        self,
+        state,
+        *,
+        positions,
+        input_ids,
+        input_ids_global,
+        forward_batch,
+        capture_dspark,
+    ):
+        model = self._model
+        aux: List[torch.Tensor] = []
+        capture_layers = (
+            set(model.dspark_layers_to_capture) if capture_dspark else set()
+        )
+        for i in self._layer_ids:
+            layer = model.layers[i]
+            assert layer.engram is None
+            if i in capture_layers:
+                from sglang.kernels.ops.layernorm.mhc import mhc_stream_mean
+
+                # The draft head reads the attention input of its target layer.
+                aux.append(mhc_stream_mean(state.residual))
+            state = layer.forward_hc_pre_from_prev(
+                positions=positions,
+                state=state,
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                input_ids_global=input_ids_global,
+            )
+        state = state.materialized(model.layers[self._layer_ids[-1]].hc_cfg)
+        return state.residual, state.pre, aux

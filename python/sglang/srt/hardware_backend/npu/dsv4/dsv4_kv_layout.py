@@ -15,9 +15,21 @@ import enum
 import torch
 
 
+def npu_pool_pages(rows: int, page_size: int) -> int:
+    """Physical pages of a PA_ND pool for ``rows`` token slots.
+
+    Whole pages plus one spare page: the paged allocator reserves page 0 for
+    padding writes, and a draft ring uses the spare page's first row as its
+    sink.
+    """
+    return (rows + page_size + 1) // page_size
+
+
 class NPUDSV4KVLayout(str, enum.Enum):
     V4_BF16 = "v4_bf16"
     V4_FP8 = "v4_fp8"
+    # A3 keeps V4.1's SWA and C1/C2 rows unquantized BF16, with BF16 index K.
+    V41_BF16 = "v41_bf16"
     V41_SWA_FP8 = "v41_fp8"
     V41_CMP_FP4 = "v41_fp4"
 
@@ -33,6 +45,7 @@ class NPUDSV4KVLayout(str, enum.Enum):
         return {
             NPUDSV4KVLayout.V4_BF16: None,
             NPUDSV4KVLayout.V4_FP8: None,
+            NPUDSV4KVLayout.V41_BF16: None,
             NPUDSV4KVLayout.V41_SWA_FP8: 32,
             NPUDSV4KVLayout.V41_CMP_FP4: 16,
         }[self]
@@ -47,6 +60,7 @@ class NPUDSV4KVLayout(str, enum.Enum):
         return {
             NPUDSV4KVLayout.V4_BF16: None,
             NPUDSV4KVLayout.V4_FP8: None,
+            NPUDSV4KVLayout.V41_BF16: None,
             NPUDSV4KVLayout.V41_SWA_FP8: "mxfp8_bf16",
             NPUDSV4KVLayout.V41_CMP_FP4: "mxfp4_bf16",
         }[self]
@@ -62,6 +76,7 @@ class NPUDSV4KVLayout(str, enum.Enum):
         return {
             NPUDSV4KVLayout.V4_BF16: None,
             NPUDSV4KVLayout.V4_FP8: None,
+            NPUDSV4KVLayout.V41_BF16: None,
             NPUDSV4KVLayout.V41_SWA_FP8: 32,
             NPUDSV4KVLayout.V41_CMP_FP4: 32,
         }[self]
@@ -76,7 +91,7 @@ class NPUDSV4KVLayout(str, enum.Enum):
         (mxfp8) or head_dim // 2 (packed mxfp4, two e2m1 per byte), scales are
         G * bf16.
         """
-        if self is NPUDSV4KVLayout.V4_BF16:
+        if self in (NPUDSV4KVLayout.V4_BF16, NPUDSV4KVLayout.V41_BF16):
             return nope_dim + rope_dim, torch.bfloat16
         if self is NPUDSV4KVLayout.V4_FP8:
             from sgl_kernel_npu.operators.mem_cache import get_npu_kv_quant_path
@@ -103,6 +118,9 @@ class NPUDSV4KVLayout(str, enum.Enum):
         and 2 share the same packed-fp4 row shape. The V4.1 scale is one uint8
         e8m0 per 32 values.
         """
+        if self is NPUDSV4KVLayout.V41_BF16:
+            # A3 stores ordinary BF16 index keys with no separate scale.
+            return head_dim, 0, torch.bfloat16, torch.float32
         if self in (NPUDSV4KVLayout.V41_SWA_FP8, NPUDSV4KVLayout.V41_CMP_FP4):
             assert head_dim % 32 == 0, head_dim
             return head_dim // 2, head_dim // 32, torch.uint8, torch.uint8

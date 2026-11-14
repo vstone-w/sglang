@@ -24,6 +24,35 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 indexer_weight_stream = None
 gva_is_inited = False
+_hccp_initialized = False
+
+
+def ensure_hccp_initialized(*, device: torch.device, group=None) -> None:
+    """Initialize HCCP before the first custom AICPU metadata kernel.
+
+    On affected CANN/driver stacks, starting HCCP after a custom AICPU kernel
+    has been dispatched invalidates its dispatch table and fails with 507018.
+    The first caller on each rank performs one TP all-reduce; later calls no-op.
+    """
+    global _hccp_initialized
+    if _hccp_initialized:
+        return
+    device = torch.device(device)
+    if (
+        device.type != "npu"
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+    ):
+        return
+    if group is None:
+        from sglang.srt.runtime_context import get_parallel
+
+        group = get_parallel().tp_group
+    if group is not None and group.world_size > 1 and group.device_group is not None:
+        warmup = torch.zeros(1, device=device)
+        torch.distributed.all_reduce(warmup, group=group.device_group)
+        torch.get_device_module(device.type).synchronize()
+    _hccp_initialized = True
 
 
 @functools.lru_cache(maxsize=1)
@@ -254,21 +283,23 @@ def init_npu_backend():
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
     try:
+        import custom_ops  # noqa: F401
         import sgl_kernel_npu  # noqa: F401
     except ImportError as e:
-        logger.warning("NPU sgl-kernel-npu package unavailable: %s", e)
+        logger.warning("NPU custom kernel packages unavailable: %s", e)
 
-    try:
-        # Registers the ds41 (DeepSeek-V4.1) Python operators under the
-        # vendor operator extension's ds41 namespace. Absent for DSV4-only
-        # deployments.
-        import cann_ops_transformer  # noqa: F401
-    except ImportError as e:
-        logger.warning(
-            "Vendor DSv4.1 operator extension unavailable; DeepSeek-V4.1 NPU "
-            "operators will not be registered: %s",
-            e,
-        )
+    if is_npu_arch35():
+        try:
+            # A5 mHC still uses the standalone extension. A3 uses bundled
+            # bindings; importing the standalone package can register
+            # conflicting ops.
+            import cann_ops_transformer  # noqa: F401
+        except ImportError as e:
+            logger.warning(
+                "cann_ops_transformer unavailable; DeepSeek-V4.1 NPU operators "
+                "will not be registered: %s",
+                e,
+            )
 
     import torch_npu
 

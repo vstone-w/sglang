@@ -214,11 +214,14 @@ def create_dsv4_backend(runner):
             f"DeepSeek-V4 cutedsl_h16 prefill requires CUDA SM90, not {platform}."
         )
     if _is_npu:
-        from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
-            DeepseekV4AscendAttnBackend,
-        )
+        from sglang.srt.platforms import current_platform
 
-        return DeepseekV4AscendAttnBackend(runner)
+        backend_cls = current_platform.get_dsv4_attention_backend_cls()
+        if backend_cls is None:
+            from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+                DeepseekV4AscendAttnBackend as backend_cls,
+            )
+        return backend_cls(runner)
     elif _is_hip:
         from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
             DeepseekV4HipRadixBackend,

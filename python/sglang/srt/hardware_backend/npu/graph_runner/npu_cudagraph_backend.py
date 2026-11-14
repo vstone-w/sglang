@@ -31,6 +31,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
+from sglang.srt.hardware_backend.npu.utils import ensure_hccp_initialized
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
@@ -67,6 +68,14 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()
         self._tp_group = get_parallel().tp_group
+        if (
+            is_deepseek_v4(cuda_graph_runner.model_runner.model_config.hf_config)
+            and self._tp_group.world_size > 1
+        ):
+            ensure_hccp_initialized(
+                device=torch.device(f"npu:{self._device_id}"),
+                group=self._tp_group,
+            )
         self._capture_stream = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver

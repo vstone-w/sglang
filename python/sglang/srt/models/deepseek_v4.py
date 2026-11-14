@@ -213,6 +213,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     image_token_types,
     materialize_image_gpu,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -1231,6 +1232,12 @@ class MqaAttentionBase(nn.Module):
     def _kernel_num_heads(self, num_tokens: int) -> int:
         if self.attn_tp_size == 1:
             return self.n_local_heads
+
+        # A platform whose kernels accept the native per-rank width returns it
+        # (NPU A3 V4.1: 32 heads under TP16/DP8); None keeps the padding rule.
+        override = current_platform.dsv4_kernel_num_heads(self, num_tokens)
+        if override is not None:
+            return override
 
         if get_platform().is_sm120:
             # Prefill already accepts the native per-rank query width.

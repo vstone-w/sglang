@@ -352,10 +352,16 @@ class TestPoolFactory(unittest.TestCase):
 
     def test_window_layout_resolves_the_row_format(self):
         fake = self._pool((0, 1, 2))
-        self.assertIs(
-            DSV4NPUTokenToKVPool._window_kv_layout(fake),
-            NPUDSV4KVLayout.V41_SWA_FP8,
-        )
+        with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
+            self.assertIs(
+                DSV4NPUTokenToKVPool._window_kv_layout(fake),
+                NPUDSV4KVLayout.V41_SWA_FP8,
+            )
+        with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=False):
+            self.assertIs(
+                DSV4NPUTokenToKVPool._window_kv_layout(fake),
+                NPUDSV4KVLayout.V41_BF16,
+            )
         fake_v4 = self._pool((0, 4, 128))
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
             self.assertIs(
@@ -382,17 +388,29 @@ class TestPoolFactory(unittest.TestCase):
                 NPUDSV4KVLayout.V4_FP8,
             )
         pinned_v41 = self._pool((0,), _npu_window_generation="v41")
-        self.assertIs(
-            DSV4NPUTokenToKVPool._window_kv_layout(pinned_v41),
-            NPUDSV4KVLayout.V41_SWA_FP8,
-        )
+        with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
+            self.assertIs(
+                DSV4NPUTokenToKVPool._window_kv_layout(pinned_v41),
+                NPUDSV4KVLayout.V41_SWA_FP8,
+            )
+        with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=False):
+            self.assertIs(
+                DSV4NPUTokenToKVPool._window_kv_layout(pinned_v41),
+                NPUDSV4KVLayout.V41_BF16,
+            )
 
     def test_compressed_kv_layout_tags_every_ratio(self):
         fake = self._pool((0, 1, 2))
-        self.assertIs(
-            DSV4NPUTokenToKVPool.compressed_kv_layout(fake, 1),
-            NPUDSV4KVLayout.V41_CMP_FP4,
-        )
+        with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
+            self.assertIs(
+                DSV4NPUTokenToKVPool.compressed_kv_layout(fake, 1),
+                NPUDSV4KVLayout.V41_CMP_FP4,
+            )
+        with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=False):
+            self.assertIs(
+                DSV4NPUTokenToKVPool.compressed_kv_layout(fake, 1),
+                NPUDSV4KVLayout.V41_BF16,
+            )
         fake_v4 = self._pool((0, 4, 128))
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
             self.assertIs(
@@ -424,9 +442,12 @@ class TestPairStatePool(unittest.TestCase):
             device="cpu",
             get_ring_size=lambda ratio: 2,
         )
-        return dsv4_memory_pool.DSV4NPUTokenToKVPool._make_pair_state_pool(
-            fake_self, enable_memory_saver=False
-        )
+        # A5 sizing: A3 additionally aligns the bank to the TP-padded batch and
+        # needs the published parallel config to resolve it.
+        with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
+            return dsv4_memory_pool.DSV4NPUTokenToKVPool._make_pair_state_pool(
+                fake_self, enable_memory_saver=False
+            )
 
     def test_pair_state_is_paged_for_the_state_cache_view(self):
         pool = self._make()
@@ -1809,19 +1830,24 @@ class TestV41PoolWriteDispatch(unittest.TestCase):
     def test_swa_buffer_routes_a_v41_pool_to_the_fp8_writer(self):
         pool = _dsv41_llm_pool(544, torch.float8_e4m3fn, NPUDSV4KVLayout.V41_SWA_FP8)
         ns = SimpleNamespace(
-            swa_kv_pool=pool, _swa_local_layer_id=lambda layer_id: layer_id
+            swa_kv_pool=pool,
+            request_window=None,
+            swa_req_ring_size=None,
+            _swa_local_layer_id=lambda layer_id: layer_id,
         )
+        ns._dead_rows_to_sink = DSV4NPUTokenToKVPool._dead_rows_to_sink
+        ns._swa_sink_row = DSV4NPUTokenToKVPool._swa_sink_row.__get__(ns)
         writer = MagicMock()
         ns._write_dsv41_packed_kv = writer
         loc = torch.tensor([3], dtype=torch.int64)
         cache = torch.zeros(1, 1, 512, dtype=torch.bfloat16)
         DSV4NPUTokenToKVPool.set_swa_buffer(ns, 0, loc, cache)
-        writer.assert_called_once_with(
-            buf=pool.kv_buffer[0],
-            loc=loc,
-            cache=cache,
-            layout=NPUDSV4KVLayout.V41_SWA_FP8,
-        )
+        kwargs = writer.call_args.kwargs
+        self.assertIs(kwargs["buf"], pool.kv_buffer[0])
+        torch.testing.assert_close(kwargs["loc"], loc)
+        torch.testing.assert_close(kwargs["cache"], cache)
+        self.assertEqual(kwargs["layout"], NPUDSV4KVLayout.V41_SWA_FP8)
+        self.assertEqual(writer.call_count, 1)
 
 
 def _metadata_recorder(shape):

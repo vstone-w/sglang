@@ -60,6 +60,11 @@ from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, is_xpu
 _is_gfx95_supported = is_gfx95_supported()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_npu_a3 = False
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+    _is_npu_a3 = not is_npu_arch35()
 _is_xpu = is_xpu()
 
 
@@ -366,15 +371,14 @@ def mix_stats_from_state(
 ) -> HcTriplet:
     """``mix_stats``, unless the combine already stashed the triplet.
 
-    The A5 NPU combine (``mhc_pre_dpskv4`` with ``cann_recipes_infer_cann920``,
-    see ``_npu_combine_premix``) predicts
-    this sublayer's ``(pre, post, comb)`` as a by-product and parks it on
-    ``state.stats``.  This consumes the fused operator's coefficients exactly
-    like the target model does (``precomputed=state.stats`` through
-    ``run_attn_post`` / ``run_moe_post``), so the draft and the target run the
-    same operator; re-predicting would take the CUDA-only sinkhorn path, which
-    has no Ascend implementation.  Every other platform leaves ``state.stats``
-    unset, so this lands on plain ``mix_stats`` there.
+    The NPU combine (see ``_npu_combine_premix``) predicts this sublayer's
+    ``(pre, post, comb)`` as a by-product and parks it on ``state.stats``.
+    This consumes those coefficients exactly like the target model does
+    (``precomputed=state.stats`` through ``run_attn_post`` / ``run_moe_post``),
+    so the draft and the target run the same operator; re-predicting would take
+    the CUDA-only sinkhorn path, which has no Ascend implementation.  Every
+    other platform leaves ``state.stats`` unset, so this lands on plain
+    ``mix_stats`` there.
     """
     if state.stats is not None:
         return state.stats
@@ -382,6 +386,10 @@ def mix_stats_from_state(
 
 
 def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
+    if _is_npu_a3 and hc.cfg.pre_from_prev:
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import mix_stats_torch
+
+        return mix_stats_torch(hc, x)
     from sglang.kernels.ops.layernorm.mhc import (
         hc_mix_stats,
         hc_mix_stats_sinkhorn,
@@ -550,17 +558,14 @@ def _npu_combine_premix(
     x: torch.Tensor,
     apply_pre: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """A5 single-pass mHC pre-mix + coefficient prediction.
+    """NPU mHC pre-mix + coefficient prediction.
 
     ``combine`` collapses the streams and ``mix_stats`` predicts the triplet in
-    two steps elsewhere; the AscendC kernel does both in one launch -- it folds
-    the residual with the *previous* sublayer's pre-mix and returns this
-    sublayer's own ``(pre, post, comb)``. Those coefficients are stashed on
-    ``state.stats``, which ``_compute_triplet`` prefers over re-predicting, so the
-    post that follows consumes them.
-
-    Recipes: models/deepseek_v4_1/models/modules/op_impls/mhc.py L57-L71
-    (``hc_pre_ascendc``) and modeling_deepseek.py L1621-L1624 / L1638-L1640.
+    two steps elsewhere; A5 folds the residual with the *previous* sublayer's
+    pre-mix in one AscendC launch, A3 uses the torch counterpart. Both return
+    this sublayer's own ``(pre, post, comb)`` and stash them on ``state.stats``,
+    which ``_compute_triplet`` prefers over re-predicting, so the post that
+    follows consumes them.
     """
     cfg = hc.cfg
     if x.shape[0] == 0:
@@ -572,6 +577,14 @@ def _npu_combine_premix(
             x.new_empty((0, cfg.mult, cfg.mult), dtype=torch.float32),
         )
         return hc.norm(x[:, 0, :])
+    if _is_npu_a3:
+        # The A3 vendor kernel has no fused mHC pre-mix op; the torch
+        # counterpart is the same math and is graph-safe.
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import mix_stats_torch
+
+        state.stats = mix_stats_torch(hc, x)
+        mixed = x[:, 0, :] if apply_pre is None else combine_premix(x, apply_pre)
+        return hc.norm(mixed)
     if apply_pre is None:
         # The first sublayer has no previous pre-mix to fold; seed the identity
         # one-hot (stream 0 on its own).
@@ -594,6 +607,11 @@ def _npu_combine_premix(
     )
     state.stats = (pre, post_mix, comb)
     return hc.norm(y)
+
+
+def combine_premix(x: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
+    """Collapse ``[T, mult, H]`` with a pre-mix, accumulating in FP32."""
+    return (pre.unsqueeze(-1) * x.float()).sum(dim=1).to(x.dtype)
 
 
 def _combine(
@@ -668,6 +686,12 @@ def post(
         return torch.empty((0, cfg.mult, x.shape[-1]), dtype=x.dtype, device=x.device)
 
     if _is_npu:
+        if _is_npu_a3:
+            # The A3 vendor kernel has no fused mHC post; the torch counterpart
+            # is the validated math.
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import post_torch
+
+            return post_torch(x, residual, post_mix, comb)
         if cfg.pre_from_prev:
             # V4.1 (A5) CANN mhc_post(x, hRes, hOut, hPost): the residual is
             # the base stream, comb its res-mixing matrix, x the sublayer

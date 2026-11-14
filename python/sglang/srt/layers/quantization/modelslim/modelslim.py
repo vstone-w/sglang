@@ -127,7 +127,11 @@ def remap_dspark_weight_name_npu(
             if rest in ("head.weight", "lm_head.weight"):
                 return "lm_head.weight"
         return None
-    if rest.startswith(("markov_head.", "confidence_head.")):
+    if rest.startswith("markov_head."):
+        # The A3 ModelSlim draft serializes the Markov head as embed/head.
+        rest = rest.replace("markov_head.embed.", "markov_head.markov_w1.", 1)
+        return rest.replace("markov_head.head.", "markov_head.markov_w2.", 1)
+    if rest.startswith("confidence_head."):
         return rest
 
     mapped_rest = rest

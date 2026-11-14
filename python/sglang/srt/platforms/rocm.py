@@ -30,3 +30,14 @@ class RocmSRTPlatform(RocmDeviceMixin, SRTPlatform):
         hicache_device_kernels=True,
         supports_pynccl=True,
     )
+
+    def supports_decoder_swa_bounded_replay(self, *, model_type: str) -> bool:
+        return model_type == "deepseek_v41"
+
+    def supports_encoder_swa_bounded_replay(self, *, model_type: str) -> bool:
+        from sglang.srt.utils.device import is_gfx95_supported
+
+        return model_type == "deepseek_v41" and is_gfx95_supported()
+
+    def decoder_replay_dp_moe_backends(self) -> tuple[str, ...]:
+        return ("none",)

@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.hardware_backend.npu.dsv4 import dsv4_mhc as npu_mhc
 from sglang.srt.models import deepseek_v4
 from sglang.srt.models import deepseek_v4_dspark as dspark
 from sglang.srt.models import deepseek_v4_mhc as mhc
@@ -251,7 +252,7 @@ class TestStageLifecycle(unittest.TestCase):
 
 
 class TestNpuMhcSeam(unittest.TestCase):
-    """V4.1 (lagged pre-mix) mHC on NPU: two CANN ops plus a plain collapse."""
+    """A3 NPU mHC: the torch pre-mix/triplet and residual mixing (no CANN ops)."""
 
     MULT, HIDDEN = 4, 8
 
@@ -282,80 +283,32 @@ class TestNpuMhcSeam(unittest.TestCase):
         x = self._residual()
         pre_prev = torch.full((2, self.MULT), 0.25)
         state = mhc.HcState(x, pre_prev)
-        seen = {}
 
-        def fake_pre_dpskv4(*args, **kwargs):
-            seen["args"] = args
-            seen["kwargs"] = kwargs
-            return (
-                x.float().mean(1),
-                torch.ones(2, self.MULT),
-                torch.ones(2, self.MULT, self.MULT),
-                torch.full((2, self.MULT), 0.5),
-            )
-
-        stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
-        stub.mhc_pre_dpskv4 = fake_pre_dpskv4
         with (
             patch.object(mhc, "_is_npu", True),
-            patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
+            patch.object(mhc, "_is_npu_a3", True),
         ):
             out = mhc.combine(hc, state)
 
-        torch.testing.assert_close(out, x.float().mean(1))
-        # The residual, the layer's weights and the flow config go in
-        # positionally -- in the CANN order (..., hc_eps, rms_eps).
-        args = seen["args"]
-        self.assertIs(args[0], x)
-        self.assertIs(args[1], hc.fn)
-        self.assertIs(args[2], hc.scale)
-        self.assertIs(args[3], hc.base)
-        self.assertEqual(args[4], self.MULT)
-        self.assertEqual(args[5], 20)
-        self.assertEqual(args[6], 1e-6)
-        self.assertEqual(args[7], 1e-6)
-        # The previous pre-mix is folded in and the pre-mix is requested back.
-        self.assertIs(seen["kwargs"]["pre_mix"], pre_prev)
-        self.assertIs(seen["kwargs"]["return_pre"], True)
-        self.assertEqual(seen["kwargs"]["impl"], "cann_recipes_infer_cann920")
-        # ``mix_stats`` is skipped: the post reads the stashed coefficients.
-        pre, post_mix, comb = state.stats
-        torch.testing.assert_close(pre, torch.full((2, self.MULT), 0.5))
-        torch.testing.assert_close(post_mix, torch.ones(2, self.MULT))
-        torch.testing.assert_close(comb, torch.ones(2, self.MULT, self.MULT))
+        torch.testing.assert_close(out, (pre_prev.unsqueeze(-1) * x.float()).sum(1))
+        # No fused CANN op: the triplet is the torch prediction, stashed for post.
+        for result, reference in zip(state.stats, npu_mhc.mix_stats_torch(hc, x)):
+            torch.testing.assert_close(result, reference)
 
-    def test_npu_first_sublayer_seeds_the_identity_one_hot(self):
+    def test_npu_first_sublayer_returns_the_first_stream(self):
         hc = self._sub_layer()
         x = self._residual()
         state = mhc.HcState(x)  # no previous pre-mix
-        seen = {}
 
-        def fake_pre_dpskv4(*args, **kwargs):
-            seen["args"] = args
-            seen["kwargs"] = kwargs
-            return (
-                x.float()[:, 0, :],
-                torch.ones(2, self.MULT),
-                torch.ones(2, self.MULT, self.MULT),
-                torch.full((2, self.MULT), 0.5),
-            )
-
-        stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
-        stub.mhc_pre_dpskv4 = fake_pre_dpskv4
         with (
             patch.object(mhc, "_is_npu", True),
-            patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
+            patch.object(mhc, "_is_npu_a3", True),
         ):
             out = mhc.combine(hc, state)
 
         torch.testing.assert_close(out, x[:, 0, :])
-        # Recipes seeds the first sublayer with the identity one-hot, i.e. the
-        # plain ``norm(x[:, 0, :])`` of the device-agnostic path.
-        expected = torch.zeros(2, self.MULT)
-        expected[:, 0] = 1.0
-        pre_mix = seen["kwargs"]["pre_mix"]
-        self.assertEqual(pre_mix.dtype, torch.float32)
-        torch.testing.assert_close(pre_mix, expected)
+        for result, reference in zip(state.stats, npu_mhc.mix_stats_torch(hc, x)):
+            torch.testing.assert_close(result, reference)
 
     def test_npu_empty_batch_skips_the_kernel(self):
         hc = self._sub_layer()
@@ -369,6 +322,7 @@ class TestNpuMhcSeam(unittest.TestCase):
         stub.mhc_pre_dpskv4 = boom
         with (
             patch.object(mhc, "_is_npu", True),
+            patch.object(mhc, "_is_npu_a3", True),
             patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
         ):
             out = mhc.combine(hc, state)
@@ -377,59 +331,24 @@ class TestNpuMhcSeam(unittest.TestCase):
         self.assertEqual(state.stats[0].shape, (0, self.MULT))
         self.assertEqual(state.stats[2].shape, (0, self.MULT, self.MULT))
 
-    def test_npu_v41_post_uses_the_cann_mhc_post_argument_order(self):
-        cfg = self._sub_layer().cfg
+    def test_npu_post_uses_the_torch_residual_mix(self):
         x = torch.zeros(2, self.HIDDEN)
         residual = self._residual()
         post_mix = torch.ones(2, self.MULT)
         comb = torch.ones(2, self.MULT, self.MULT)
-        seen = {}
-
-        def fake_mhc_post(a, b, c, d):
-            seen["args"] = (a, b, c, d)
-            return residual + 1.0
-
-        with (
-            patch.object(mhc, "_is_npu", True),
-            patch.object(
-                torch,
-                "ops",
-                SimpleNamespace(
-                    cann_ops_transformer=SimpleNamespace(mhc_post=fake_mhc_post)
-                ),
-            ),
-        ):
-            out = mhc.post(cfg, x, residual, post_mix, comb)
-
-        # Schema mhc_post(x, hRes, hOut, hPost).
-        self.assertEqual(seen["args"], (residual, comb, x, post_mix))
-        torch.testing.assert_close(out, residual + 1.0)
-
-    def test_npu_v4_post_delegates_the_kernel_choice_to_sgl_kernel_npu(self):
-        # The pre-950 / Ascend 950 (batched) npu_hc_post choice moved into the
-        # sgl_kernel_npu wrapper, so sglang owns only the delegation: assert the
-        # four operands pass through in order and the result is forwarded.
-        cfg = self._sub_layer(pre_from_prev=False).cfg
-        x = torch.zeros(2, self.HIDDEN)
-        residual = self._residual()
-        post_mix = torch.ones(2, self.MULT)
-        comb = torch.ones(2, self.MULT, self.MULT)
-        seen = {}
-
-        def fake_mhc_post_dpskv4(a, b, c, d):
-            seen["args"] = (a, b, c, d)
-            return residual + 1.0
-
-        stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
-        stub.mhc_post_dpskv4 = fake_mhc_post_dpskv4
-        with (
-            patch.object(mhc, "_is_npu", True),
-            patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
-        ):
-            out = mhc.post(cfg, x, residual, post_mix, comb)
-
-        self.assertEqual(seen["args"], (x, residual, post_mix, comb))
-        torch.testing.assert_close(out, residual + 1.0)
+        expected = (
+            torch.bmm(comb.float().transpose(1, 2), residual.float())
+            + post_mix.float().unsqueeze(-1) * x.float().unsqueeze(1)
+        ).to(x.dtype)
+        for pre_from_prev in (True, False):
+            with self.subTest(pre_from_prev=pre_from_prev):
+                cfg = self._sub_layer(pre_from_prev=pre_from_prev).cfg
+                with (
+                    patch.object(mhc, "_is_npu", True),
+                    patch.object(mhc, "_is_npu_a3", True),
+                ):
+                    out = mhc.post(cfg, x, residual, post_mix, comb)
+                torch.testing.assert_close(out, expected)
 
 
 if __name__ == "__main__":
