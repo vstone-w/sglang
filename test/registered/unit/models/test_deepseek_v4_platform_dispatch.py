@@ -255,6 +255,13 @@ class TestNpuMhcSeam(unittest.TestCase):
 
     MULT, HIDDEN = 4, 8
 
+    def setUp(self):
+        # These cases cover the A5 CANN ops; the A3 torch path has its own
+        # suite (test_npu_dsv41_mhc_moe).
+        patcher = patch.object(mhc, "is_npu_arch35", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _sub_layer(self, *, pre_from_prev=True):
         return mhc.HcSubLayer(
             cfg=mhc.HcConfig(

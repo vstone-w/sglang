@@ -104,6 +104,27 @@ def _seqused_q_kwargs(cu_seqlens_q: Optional[torch.Tensor]) -> dict:
     return {"seqused_q": (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int32)}
 
 
+def _ensure_dsv41_static_verify_mode() -> None:
+    """Require fixed-width low-ratio verification on both NPU generations.
+
+    The low-ratio verify metadata pipeline assumes the STATIC request-major
+    rectangle (``bs * (num_draft_tokens + 1)`` rows of contiguous positions
+    per request), which COMPACT's ragged variable-length layout breaks.
+    CAP_ACCEPT only changes the accept-length accounting, so it rides the
+    STATIC execution path for free.  Failing at startup -- instead of at the
+    first verify step -- keeps the misconfiguration visible before any
+    compressed state is written.
+    """
+    if read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT:
+        return
+    raise RuntimeError(
+        "DeepSeek-V4.1 on NPU does not support "
+        "SGLANG_RAGGED_VERIFY_MODE=compact: the low-ratio verify metadata "
+        "requires the STATIC request-major verify layout. Unset "
+        "SGLANG_RAGGED_VERIFY_MODE (or set it to 'static' or 'cap-accept')."
+    )
+
+
 @functools.cache
 def _ds41_ops():
     """Resolve the seven DSV4.1 DSL operator APIs (``_dsl`` suffix, sgl-kernel-npu
@@ -2901,6 +2922,9 @@ class DeepseekV4AscendAttnBackend(
                 f"(got {self._dsv4_q_head_num}): check num_attention_heads and "
                 "the attention TP size."
             )
+        if self._dsv4_has_low_ratio:
+            # Both A3 indexers and the A5 metadata path require fixed Q blocks.
+            _ensure_dsv41_static_verify_mode()
         if self._dsv4_has_low_ratio and not is_npu_arch35():
             _dsv41_a3_ops()
             # Resolve the public API here; graph warmup loads the lazy binding.
@@ -2963,9 +2987,6 @@ class DeepseekV4AscendAttnBackend(
         # coverage is handled by the speculative runner.
         if self.is_draft_worker:
             return False
-        # The captured prefill state has no C1/C2 index or candidate buffers.
-        if self._dsv4_has_low_ratio and not is_npu_arch35():
-            return False
         parallel = get_parallel()
         if parallel.attn_cp_size != 1 or parallel.attn_dcp_size != 1:
             raise ValueError(
@@ -2983,8 +3004,9 @@ class DeepseekV4AscendAttnBackend(
 
         DeepSeek-V4.1 (ratios 1/2) runs DSpark on the STATIC verify layout only.
         Its low-ratio rows assume the STATIC request-major rectangle, so another
-        spec algorithm, or a ragged mode (CAP_ACCEPT / COMPACT), would scatter
-        this step's compressed rows to stale slots; both are rejected at startup.
+        spec algorithm or COMPACT's ragged layout would scatter this step's
+        compressed rows to stale slots; both are rejected at startup. CAP_ACCEPT
+        only changes the accept-length accounting and rides the STATIC path.
         The generation is read from ``_dsv4_is_v41_model`` rather than the ratio
         list, which a draft worker empties.
 
@@ -3003,13 +3025,7 @@ class DeepseekV4AscendAttnBackend(
                 "DeepSeek-V4.1 on NPU supports only DSpark speculative "
                 f"decoding (static mode), got {spec_algorithm!r}."
             )
-        ragged_mode = read_ragged_verify_mode()
-        if ragged_mode is not RaggedVerifyMode.STATIC:
-            raise ValueError(
-                "DeepSeek-V4.1 on NPU supports only DSpark speculative "
-                "decoding in static mode (SGLANG_RAGGED_VERIFY_MODE=static), "
-                f"got SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value!r}."
-            )
+        _ensure_dsv41_static_verify_mode()
 
     def _validate_draft_window_rows(self) -> None:
         """A draft worker's window rows must match the V4 sparse-attention op.
@@ -3072,7 +3088,9 @@ class DeepseekV4AscendAttnBackend(
             seq_lens=forward_batch.seq_lens, block_size=block_size
         )
         # The query is padded to an attn_tp multiple (prepare_mlp_sync_batch),
-        # but seq_lens is not, so pad the tail with -1/0 to match.
+        # but seq_lens is not, so pad the tail with -1/0 to match. The V4.1 A3
+        # draft's TND operator needs Q rows to agree with cu_seqlens_q instead;
+        # _forward_swa trims TP-only rows before attention and pads its output.
         num_padded_tokens = forward_batch.out_cache_loc.shape[0]
         if (
             not self._is_dsv41_a3_dspark_draft
@@ -3367,6 +3385,10 @@ class DeepseekV4AscendAttnBackend(
             )
 
         if self._is_dspark_draft_worker:
+            if self._is_dsv41_a3_dspark_draft:
+                self.graph_metadata["kernel_metadata_c1a"] = torch.zeros(
+                    2048, dtype=torch.int32, device=device
+                )
             block_size = self._dsv4_graph_tokens_per_req
             sparse_width = _dspark_sparse_width(
                 self._dsv4_sliding_window_size, block_size
@@ -3586,6 +3608,9 @@ class DeepseekV4AscendAttnBackend(
             metadata.ori_win_right = 0
 
         if self._is_dsv41_a3_dspark_draft:
+            metadata.kernel_metadata["c1a_metadata"] = self.graph_metadata[
+                "kernel_metadata_c1a"
+            ]
             metadata.kernel_metadata["c1a_metadata"].copy_(
                 self._dsv41_a3_draft_kernel_metadata(bs, metadata=metadata)
             )
@@ -4219,7 +4244,8 @@ class DeepseekV4AscendAttnBackend(
         ):
             if key in kernel_metadata_new:
                 fm.kernel_metadata[key].copy_(kernel_metadata_new[key])
-        if self._dsv4_has_c4:
+        # A3 drafts have no C4 pool; retain the upstream A5 refresh behavior.
+        if is_npu_arch35() or self._dsv4_has_c4:
             fm.c4_topk_indices.fill_(-1)
 
     def _apply_dsv4_graph_metadata(
@@ -4721,7 +4747,7 @@ class DeepseekV4AscendAttnBackend(
             layout_kv="PA_BBND",
         )
         if indices is not None:
-            kwargs["ori_topk_length"] = fm.ori_topk_length
+            kwargs["ori_topk_length"] = (indices >= 0).sum(-1, dtype=torch.int32)
         return kwargs
 
     def _dsv41_a3_draft_kernel_metadata(self, bs, metadata=None):

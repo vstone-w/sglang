@@ -29,6 +29,7 @@ for mod in (
     "sgl_kernel_npu.operators.attention",
     "sgl_kernel_npu.operators.indexer",
     "sgl_kernel_npu.operators.mem_cache",
+    "sgl_kernel_npu.operators.data_move",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
     "sgl_kernel_npu.kvcacheio",

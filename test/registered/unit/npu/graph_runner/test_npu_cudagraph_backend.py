@@ -32,7 +32,15 @@ def _make_backend(runner=None):
     # a white-box runner to exercise a specific replay() branch.
     if runner is None:
         runner = SimpleNamespace(
-            device_module=_device_module_stub(), enable_torch_compile=False
+            device_module=_device_module_stub(),
+            enable_torch_compile=False,
+            # The backend reads hf_config for the DSV4 HCCP warmup; a non-DSV4
+            # config keeps that path off (and the tp-group stub unexercised).
+            model_runner=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"])
+                )
+            ),
         )
     with (
         get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
@@ -86,6 +94,41 @@ def _make_decode_runner(raw_bs=2, bs=2):
         is_target_verify=mock.Mock(return_value=False)
     )
     return runner
+
+
+class TestDSV4HCCPWarmup(unittest.TestCase):
+    """DSV4 graph capture warms HCCP before the first AICPU metadata kernel."""
+
+    def _make_backend(self, *, world_size):
+        runner = SimpleNamespace(
+            device_module=_device_module_stub(),
+            enable_torch_compile=False,
+            model_runner=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+                )
+            ),
+        )
+        tp_group = SimpleNamespace(world_size=world_size, device_group=mock.Mock())
+        with (
+            get_parallel().override(tp_group=tp_group),
+            mock.patch.object(
+                mod.TorchMemorySaverAdapter, "create", return_value=None
+            ),
+            mock.patch.object(mod.torch.distributed, "all_reduce") as all_reduce,
+        ):
+            backend = mod.NPUCudaGraphBackend(runner)
+        return backend, runner, all_reduce
+
+    def test_multi_die_tp_warmup_collective_and_sync(self):
+        _, runner, all_reduce = self._make_backend(world_size=2)
+        all_reduce.assert_called_once()
+        runner.device_module.synchronize.assert_called_once()
+
+    def test_single_die_tp_skips_the_warmup(self):
+        _, runner, all_reduce = self._make_backend(world_size=1)
+        all_reduce.assert_not_called()
+        runner.device_module.synchronize.assert_not_called()
 
 
 class TestNPUCudaGraphBackend(unittest.TestCase):

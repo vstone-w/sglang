@@ -38,9 +38,10 @@ for mod in (
     "sgl_kernel_npu.operators.attention",
     "sgl_kernel_npu.operators.indexer",
     "sgl_kernel_npu.operators.mem_cache",
-    # pool_host/{mha,mamba}.py import this under ``if _is_npu``, so only a
+    # pool_host/{mha,mamba}.py import these under ``if _is_npu``, so only a
     # real-NPU environment reaches the import; a mock parent without
     # ``__path__`` would fail the from-import before the names resolve.
+    "sgl_kernel_npu.operators.data_move",
     "sgl_kernel_npu.kvcacheio",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
@@ -120,11 +121,20 @@ dsv4_backend._ds41_ops = lambda: DS41
 
 
 def setUpModule():
-    # DS41 mocks the packed A5 ABI, regardless of the machine collecting the suite.
-    for module in (dsv4_backend, dsv4_memory_pool):
-        unittest.enterModuleContext(
-            patch.object(module, "is_npu_arch35", return_value=True)
-        )
+    # This suite describes the arch35 packed path. A3 has separate BF16
+    # contract tests; do not let the host running this suite select its ABI.
+    global _arch_patches
+    _arch_patches = [
+        patch.object(module, "is_npu_arch35", return_value=True)
+        for module in (dsv4_backend, dsv4_memory_pool)
+    ]
+    for arch_patch in _arch_patches:
+        arch_patch.start()
+
+
+def tearDownModule():
+    for arch_patch in reversed(_arch_patches):
+        arch_patch.stop()
 
 
 def _low_ratio_backend(*, ratios=(1, 2), window=128):
@@ -191,6 +201,7 @@ def _replay_decode_rows(batch, live):
     backend = _low_ratio_backend()
     metadata = SimpleNamespace(
         block_tables=torch.zeros((len(live), 1), dtype=torch.int32),
+        actual_seq_lengths_kv=torch.ones(len(live), dtype=torch.int32),
         kernel_metadata={},
     )
     _seed_graph_index_page_tables(backend, bs=len(live), cols=1)
@@ -763,7 +774,10 @@ class TestRatioMetadata(unittest.TestCase):
 class TestGraphBuffers(unittest.TestCase):
     def test_init_allocates_stable_buffers_and_dispatch_tables(self):
         backend = _low_ratio_backend()
-        metadata = SimpleNamespace(block_tables=torch.zeros((4, 2), dtype=torch.int32))
+        metadata = SimpleNamespace(
+            block_tables=torch.zeros((4, 2), dtype=torch.int32),
+            actual_seq_lengths_kv=torch.ones(4, dtype=torch.int32),
+        )
         metadata.kernel_metadata = {}
         _seed_graph_index_page_tables(backend, bs=4, cols=2)
         backend._init_dsv41_graph_metadata(
@@ -788,7 +802,11 @@ class TestGraphBuffers(unittest.TestCase):
     def test_graph_index_page_table_is_a_shared_graph_buffer_row_slice(self):
         backend = _low_ratio_backend()
         block_tables = torch.tensor([[7, 8]], dtype=torch.int32)
-        metadata = SimpleNamespace(block_tables=block_tables, kernel_metadata={})
+        metadata = SimpleNamespace(
+            block_tables=block_tables,
+            actual_seq_lengths_kv=torch.ones(1, dtype=torch.int32),
+            kernel_metadata={},
+        )
         _seed_graph_index_page_tables(backend, bs=1, cols=2)
         backend._init_dsv41_graph_metadata(
             metadata, bs=1, tokens_per_req=1, device="cpu"
@@ -807,6 +825,7 @@ class TestGraphBuffers(unittest.TestCase):
         backend.page_size = 128
         metadata = SimpleNamespace(
             block_tables=torch.tensor([[7, 8]], dtype=torch.int32),
+            actual_seq_lengths_kv=torch.ones(1, dtype=torch.int32),
             kernel_metadata={},
         )
         _seed_graph_index_page_tables(backend, bs=1, cols=2)
@@ -842,7 +861,11 @@ class TestGraphBuffers(unittest.TestCase):
         """
         backend = _low_ratio_backend()
         block_tables = torch.tensor([[7, 8]], dtype=torch.int32)
-        metadata = SimpleNamespace(block_tables=block_tables, kernel_metadata={})
+        metadata = SimpleNamespace(
+            block_tables=block_tables,
+            actual_seq_lengths_kv=torch.ones(1, dtype=torch.int32),
+            kernel_metadata={},
+        )
         _seed_graph_index_page_tables(backend, bs=1, cols=2)
         backend._init_dsv41_graph_metadata(
             metadata, bs=1, tokens_per_req=1, device="cpu"
@@ -854,7 +877,11 @@ class TestGraphBuffers(unittest.TestCase):
         backend = _low_ratio_backend()
         backend.page_size = 128
         block_tables = torch.tensor([[7, 8]], dtype=torch.int32)
-        metadata = SimpleNamespace(block_tables=block_tables, kernel_metadata={})
+        metadata = SimpleNamespace(
+            block_tables=block_tables,
+            actual_seq_lengths_kv=torch.ones(1, dtype=torch.int32),
+            kernel_metadata={},
+        )
         _seed_graph_index_page_tables(backend, bs=1, cols=2)
         backend._init_dsv41_graph_metadata(
             metadata, bs=1, tokens_per_req=1, device="cpu"
@@ -877,7 +904,10 @@ class TestGraphBuffers(unittest.TestCase):
 
     def test_replay_refresh_writes_into_the_same_buffers(self):
         backend = _low_ratio_backend()
-        metadata = SimpleNamespace(block_tables=torch.zeros((2, 2), dtype=torch.int32))
+        metadata = SimpleNamespace(
+            block_tables=torch.zeros((2, 2), dtype=torch.int32),
+            actual_seq_lengths_kv=torch.ones(2, dtype=torch.int32),
+        )
         metadata.kernel_metadata = {}
         _seed_graph_index_page_tables(backend, bs=2, cols=2)
         backend._init_dsv41_graph_metadata(
@@ -936,6 +966,7 @@ class TestGraphBuffers(unittest.TestCase):
                 with self.subTest(bs=bs, width=width):
                     metadata = SimpleNamespace(
                         block_tables=torch.zeros((bs, 2), dtype=torch.int32),
+                        actual_seq_lengths_kv=torch.ones(bs, dtype=torch.int32),
                         kernel_metadata={},
                     )
                     _seed_graph_index_page_tables(backend, bs=bs, cols=2)
@@ -1645,14 +1676,16 @@ class TestVerifyGraphGuards(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "DSpark"):
             self._gate(is_dflash=True)
 
-    def test_v41_rejects_every_ragged_mode_even_for_dspark(self):
-        # CAP_ACCEPT and COMPACT both leave the STATIC request-major rectangle.
-        # Match the env-var name, not "DSpark": both raises mention DSpark, so
-        # only this pins the mode check as the one that fired.
-        for mode in (RaggedVerifyMode.CAP_ACCEPT, RaggedVerifyMode.COMPACT):
-            with self.subTest(mode=mode):
-                with self.assertRaisesRegex(ValueError, "SGLANG_RAGGED_VERIFY_MODE"):
-                    self._gate(mode=mode, is_dspark=True)
+    def test_v41_allows_cap_accept_under_dspark(self):
+        # CAP_ACCEPT only changes accept-length accounting; execution stays on
+        # the STATIC request-major rectangle the low-ratio rows assume.
+        self._gate(mode=RaggedVerifyMode.CAP_ACCEPT, is_dspark=True)
+
+    def test_v41_rejects_compact_under_dspark(self):
+        # Match the env-var name: the DSpark-only gate mentions DSpark too, so
+        # this pins the mode check as the one that fired.
+        with self.assertRaisesRegex(RuntimeError, "SGLANG_RAGGED_VERIFY_MODE"):
+            self._gate(mode=RaggedVerifyMode.COMPACT, is_dspark=True)
 
     def test_no_spec_decoding_is_not_gated(self):
         # The constraints are about speculative decoding; a decode-only V4.1 run
@@ -1853,7 +1886,10 @@ class TestKernelMetadataBuilders(unittest.TestCase):
 
     def _backend(self, *, bs=2, tokens_per_req=1):
         backend = _low_ratio_backend()
-        metadata = SimpleNamespace(block_tables=torch.zeros((bs, 2), dtype=torch.int32))
+        metadata = SimpleNamespace(
+            block_tables=torch.zeros((bs, 2), dtype=torch.int32),
+            actual_seq_lengths_kv=torch.ones(bs, dtype=torch.int32),
+        )
         metadata.kernel_metadata = {}
         _seed_graph_index_page_tables(backend, bs=bs, cols=2)
         backend._init_dsv41_graph_metadata(
@@ -2247,6 +2283,7 @@ class TestVerifyGraphRefresh(unittest.TestCase):
     def _graph_metadata(self, backend, bs, tokens_per_req):
         metadata = SimpleNamespace(
             block_tables=torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)[:bs],
+            actual_seq_lengths_kv=torch.ones(bs, dtype=torch.int32),
             kernel_metadata={},
         )
         _seed_graph_index_page_tables(backend, bs=bs, cols=2)

@@ -293,17 +293,19 @@ def init_npu_backend():
     except ImportError as e:
         logger.warning("NPU sgl-kernel-npu package unavailable: %s", e)
 
+    if is_npu_arch35():
+        try:
+            # A5 mHC still uses the standalone extension. A3 uses bundled bindings;
+            # importing the standalone package can register conflicting ops.
+            import cann_ops_transformer  # noqa: F401
+        except ImportError as e:
+            logger.warning(
+                "cann_ops_transformer unavailable; DeepSeek-V4.1 NPU operators "
+                "will not be registered: %s",
+                e,
+            )
+
     import torch_npu
-
-    def register_dsv41_vendor_ops():
-        if is_npu_arch35():
-            try:
-                import cann_ops_transformer  # noqa: F401
-            except ImportError as e:
-                logger.warning("DeepSeek-V4.1 A5 operator extension unavailable: %s", e)
-
-    # Select A5's vendor bindings after device selection. A3 uses sgl-kernel-npu.
-    torch_npu.npu._lazy_call(register_dsv41_vendor_ops)
 
     # These imports lead to unpredictable behavior in diffusion models
     # and a significant reduction in performance.

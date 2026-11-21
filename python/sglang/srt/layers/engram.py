@@ -415,8 +415,15 @@ class EngramHasher(nn.Module):
             layout = forward_batch.ragged_verify_layout
             if layout is None:
                 block = int(forward_batch.spec_info.draft_token_num)
-                assert num_tokens == bs * block, (
-                    "engram target-verify expects one equal block per request, got "
+                # Rows at or past num_real are padding: the eager MLP-sync path
+                # aligns the verify batch for the attn-TP reduce-scatter (and
+                # DP attention may widen it to the gather's max length). They
+                # are hashed like real rows and discarded by the consumers, and
+                # target verify commits no history, so only the real blocks are
+                # load-bearing.
+                num_real = bs * block
+                assert num_real <= num_tokens, (
+                    "engram target-verify expects whole blocks per request, got "
                     f"{num_tokens} tokens for {bs} requests of {block}"
                 )
                 kmode = MODE_VERIFY
@@ -1782,11 +1789,9 @@ def engram_gate(
     # Signed square root before the sigmoid, matching the training kernel.
     magnitude = dot.abs().clamp_min(clamp_value).sqrt()
     if dot.device.type == "npu":
-        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
-        # A3 reads the FP32 sign bit during graph capture, including for -0.
-        negative = dot < 0 if is_npu_arch35() else dot.view(torch.int32) < 0
-        signed_root = torch.where(negative, -magnitude, magnitude)
+        # copysign can fall back to CPU during NPU graph capture. Read the
+        # FP32 sign bit through an integer view to preserve negative zero.
+        signed_root = torch.where(dot.view(torch.int32) < 0, -magnitude, magnitude)
     else:
         signed_root = torch.copysign(magnitude, dot)
     gate = torch.sigmoid(signed_root)

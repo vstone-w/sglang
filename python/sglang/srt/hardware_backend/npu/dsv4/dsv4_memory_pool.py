@@ -123,14 +123,15 @@ def _write_dsv41_bf16_rows(buf, loc, cache):
 class DSV41NPUSingleKVPool(NPUDeepSeekV4SingleKVPool):
     """NPU DeepSeek-V4.1 KV pool.
 
-    A3 stores unquantized BF16 rows. A5 rows are fully quantized by
-    ``kv_compress_epilog_v2`` (no bf16 RoPE tail), so
-    the row width and store dtype come from :class:`NPUDSV4KVLayout`.
+    A3 uses unquantized BF16 rows; A5 rows are fully quantized by
+    ``kv_compress_epilog_v2`` (no bf16 RoPE tail). Both layouts are described
+    by :class:`NPUDSV4KVLayout`.
     ``V41_SWA_FP8`` is the model-wide window/main pool (FP8 E4M3 group 32, 544 B)
     and ``V41_CMP_FP4`` one ratio's compressed pool (FP4 E2M1 group 16, 320 B,
     whose page holds ``page_size // ratio`` rows so its page id lines up with the
     full page id). The ratio-1 compressed pool keeps the global page size like the
-    window pool but still takes the compressed row format, pre-tagged through
+    window pool but must still take the compressed row format; it arrives
+    pre-tagged through
     ``DSV4NPUTokenToKVPool.compressed_kv_layout()``.
     """
 
@@ -402,7 +403,9 @@ class DSV41NPUIndexerPool(NPUDeepSeekV4IndexerPool):
     def _npu_index_row_dims(self) -> Tuple[int, int, torch.dtype, torch.dtype]:
         assert self.index_head_dim > 0, self.index_head_dim
         layout = (
-            NPUDSV4KVLayout.V41_CMP_FP4 if is_npu_arch35() else NPUDSV4KVLayout.V41_BF16
+            NPUDSV4KVLayout.V41_CMP_FP4
+            if is_npu_arch35()
+            else NPUDSV4KVLayout.V41_BF16
         )
         return layout.indexer_kv_info(self.index_head_dim)
 
@@ -462,7 +465,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
 
     def compressed_kv_layout(self, compress_ratio: int):
-        """V4.1 low ratios use BF16 on A3 and epilog_v2 FP4 rows on A5."""
+        """Row format of a compressed pool: V4.1 uses BF16 on A3 and
+        epilog_v2's fp4 rows on A5; the V4 ratios follow the part."""
         if compress_ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS and self._is_v41_model():
             return (
                 NPUDSV4KVLayout.V41_CMP_FP4
@@ -593,7 +597,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         :attr:`CompressStatePool.state_cache_3d` raises. That view is the
         ``state_cache`` the fused ``ds41.compressor`` gets on arch35, with one
         request bank per ``state_block_table`` row. A3 also needs physical
-        capacity for TP-padded batches.
+        capacity for TP-padded batches. Only the second-axis page size is set
+        here; sizing, ring ownership and the PD transfer indices stay in
+        :class:`CompressStatePool`.
         """
         ring_size = self.get_ring_size(2)
         num_req_slots = self.num_req_slots

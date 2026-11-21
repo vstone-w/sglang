@@ -29,6 +29,33 @@ class TestW4A8Int8MoEBias(CustomTestCase):
         )
         return layer
 
+    def test_w2_scheme_keeps_all_checkpoint_segments(self):
+        # The checkpoint stores all 16 compensation segments; the channel
+        # loader copies them and _update_bias selects the rank's TP shard.
+        # Narrowing the parameter here would shard twice under MoE TP.
+        from sglang.srt.layers.moe.fused_moe_triton import (
+            FusedMoeWeightScaleSupported,
+        )
+        from sglang.srt.layers.quantization.modelslim.schemes import (
+            ModelSlimW4A8Int8MoE,
+        )
+
+        layer = torch.nn.Module()
+        layer.moe_tp_size = 2
+        layer.moe_tp_rank = 0
+        scheme = ModelSlimW4A8Int8MoE({}, weight_prefix="w2", group_size=0)
+        scheme.create_weights(
+            layer,
+            num_experts=2,
+            hidden_size=6,
+            intermediate_size_per_partition=8,
+        )
+        self.assertEqual(tuple(layer.w2_scale_bias.shape), (2, 6, 16))
+        self.assertEqual(
+            layer.w2_scale_bias.quant_method,
+            FusedMoeWeightScaleSupported.CHANNEL.value,
+        )
+
     def test_w2_compensation_follows_each_k_partition(self):
         # Nonuniform segments distinguish the correct rank-local compensation
         # from both a replicated full sum and a full sum divided by TP size.

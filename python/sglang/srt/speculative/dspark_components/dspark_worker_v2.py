@@ -1,3 +1,4 @@
+import contextlib
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, runtime_checkable
 
@@ -196,6 +197,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
         self._draft_worker = None
+        # Set before build_draft_tp_worker runs inside _draft_context; the
+        # real value follows once the draft model exists.
+        self._npu_draft_bf16_dispatch = False
         self.enable_dp_spec_prefill_coordination = (
             envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         )
@@ -248,6 +252,17 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
+        # An unquantized draft dispatches bf16 while the target's A3 recipe
+        # leaves DEEP_NORMAL_MODE_USE_INT8_QUANT on; deep_ep reads the flags
+        # per dispatch, so they are scoped to the draft's own execution below
+        # instead of the target's. Dense draft classes carry no quant_config
+        # and never hit the A8W16 path, so they opt out here.
+        try:
+            self._npu_draft_bf16_dispatch = bool(
+                _is_npu and self.draft_model.quant_config is None
+            )
+        except AttributeError:
+            self._npu_draft_bf16_dispatch = False
         self._draft_sampler = None
 
         # The mask token is input-only (it is embedded, never sampled), so its
@@ -624,8 +639,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @contextlib.contextmanager
     def _draft_context(self):
-        return draft_tp_context(self.draft_parallel_layout)
+        with draft_tp_context(self.draft_parallel_layout):
+            if not self._npu_draft_bf16_dispatch:
+                yield
+                return
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
+                stack.enter_context(
+                    envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
+                )
+                yield
 
     def alloc_memory_pool(
         self,
