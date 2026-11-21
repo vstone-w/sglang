@@ -55,9 +55,18 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if num_new_pages_item > len(self.free_pages):
             return None
 
+        alloc_extend_indices = None
         if num_new_pages_item < 200:
-            from sgl_kernel_npu.operators.mem_cache import alloc_extend_indices
+            try:
+                from sgl_kernel_npu.operators.mem_cache import (
+                    alloc_extend_indices,
+                )
+            except ImportError:
+                # Release wheels predate the fast allocator; the naive path
+                # below is the same algorithm.
+                alloc_extend_indices = None
 
+        if alloc_extend_indices is not None:
             out_indices = torch.empty(
                 (extend_num_tokens,),
                 dtype=torch.int64,

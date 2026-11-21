@@ -2,6 +2,7 @@
 argmax at temperature 0 and a Gumbel-max sample otherwise."""
 
 import functools
+import inspect
 from typing import Callable, Optional
 
 import torch
@@ -252,6 +253,12 @@ def _launch_partial(
     return partial.view(rows, parts * 2)
 
 
+@functools.lru_cache(maxsize=None)
+def _vendor_kwargs(func) -> frozenset:
+    """Keyword names an operator accepts; release wheels trail the caller."""
+    return frozenset(inspect.signature(func).parameters)
+
+
 class MarkovSampleStep:
     """Returns global token ids. ``bias`` covers the first ``width`` columns of
     the rank's padded shard ``base_logits``. Sharded, ``gather`` exchanges
@@ -265,7 +272,18 @@ class MarkovSampleStep:
             if _is_npu:
                 from sgl_kernel_npu.operators.sample import markov_sample_step_triton
 
-                return markov_sample_step_triton(**kwargs)
+                accepted = _vendor_kwargs(markov_sample_step_triton)
+                # Newer callers pass softcap/vocab_limit. The release wheel
+                # predates them; when set, the torch implementation is exact.
+                if any(
+                    name not in accepted and value is not None
+                    for name, value in kwargs.items()
+                ):
+                    return cls.torch(**kwargs)
+                supported = {
+                    name: value for name, value in kwargs.items() if name in accepted
+                }
+                return markov_sample_step_triton(**supported)
             return cls.triton(**kwargs)
         return cls.torch(**kwargs)
 
