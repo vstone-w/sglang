@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_musa,
+    is_npu,
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -57,6 +58,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
 _is_musa = is_musa()
@@ -415,13 +417,13 @@ def fused_experts(
         )
 
 
-@torch.compile
+@torch.compile(disable=_is_npu)
 def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
     torch.sum(x, dim=1, out=out)
     out.mul_(routed_scaling_factor)
 
 
-@torch.compile
+@torch.compile(disable=_is_npu)
 def _swiglu_silu_clamp_mul(x, gemm1_limit):
     gate, up = x.chunk(2, dim=-1)
     gate = F.silu(gate)
@@ -430,7 +432,7 @@ def _swiglu_silu_clamp_mul(x, gemm1_limit):
     return gate * up
 
 
-@torch.compile
+@torch.compile(disable=_is_npu)
 def swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
     # NOTE: This variant uses gemm1_alpha, unlike _swiglu_silu_clamp_mul.
     # At present, only GPT-OSS uses this variant.
@@ -440,7 +442,7 @@ def swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
     return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
 
 
-@torch.compile
+@torch.compile(disable=_is_npu)
 def swiglu_no_interleaved_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
     gate, up = x.chunk(2, dim=-1)
     gate = gate.clamp(min=None, max=gemm1_limit)
