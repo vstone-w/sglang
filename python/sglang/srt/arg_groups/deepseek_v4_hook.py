@@ -408,9 +408,21 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             and cfg.enable_prefill_cp
             and cfg.cp_strategy == "interleave"
         )
+        # Ascend reuses the positional target/draft SWA and request-state
+        # transport. Keep its initial DSpark support to CP=1 on both roles;
+        # the GPU prefill-CP exception below has not been validated on NPU.
+        ascend_transfer = cfg.disaggregation_transfer_backend == "ascend"
+        if ascend_transfer and (
+            cfg.device != "npu" or cfg.enable_prefill_cp or cfg.attn_cp_size != 1
+        ):
+            raise ValueError(
+                "DeepSeek-V4.1 DSpark PD with Ascend requires --device npu "
+                "and CP=1 on both prefill and decode; disable --enable-prefill-cp."
+            )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-            or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl", "mori")
+            or cfg.disaggregation_transfer_backend
+            not in ("mooncake", "nixl", "mori", "ascend")
             or (
                 (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
                 and not supported_prefill_cp
@@ -419,7 +431,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, NIXL, "
-                "or MoRI, DCP=1, and CP=1 on decode. Prefill CP requires "
+                "MoRI, or Ascend (NPU, CP=1 on both roles), DCP=1, and CP=1 "
+                "on decode. GPU prefill CP requires "
                 "--enable-prefill-cp with the interleave strategy. "
                 "DP attention is supported when "
                 "both servers use the same block size and target/draft KV layout."
