@@ -122,7 +122,7 @@ def _index_pool(classes, size=256):
 
 
 class TestA3PairStatePool(unittest.TestCase):
-    def _make(self, num_req_slots, padded_batch, *, arch35=False):
+    def _make(self, num_req_slots, padded_batch, *, arch35=False, ring_size=2):
         # Exercise the real shared allocator/layout on CPU; only memory-pool
         # integration and the runtime parallel configuration are stubbed.
         state = _load_definitions(
@@ -153,7 +153,7 @@ class TestA3PairStatePool(unittest.TestCase):
             qk_nope_head_dim=448,
             qk_rope_head_dim=64,
             device="cpu",
-            get_ring_size=lambda _: 2,
+            get_ring_size=lambda _: ring_size,
         )
         pool = classes["DSV4NPUTokenToKVPool"]._make_pair_state_pool(owner, False)
         self.assertEqual(owner.num_req_slots, num_req_slots)
