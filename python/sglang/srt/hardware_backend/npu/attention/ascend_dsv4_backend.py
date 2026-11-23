@@ -150,9 +150,6 @@ def _dsv41_a3_ops():
         attention=sparse_flash_mla,
         metadata=sparse_flash_mla_metadata,
         indexer=lightning_indexer_v2,
-        # The public API selects the four-output overload when candidate
-        # arguments are supplied; ordinary top-k still returns two outputs.
-        candidate=lightning_indexer_v2,
         sparse_indexer=sparse_lightning_indexer,
     )
 
@@ -1599,7 +1596,7 @@ class LowRatioCompressAscendBackendMixin:
         if not is_npu_arch35():
             kwargs = self._dsv41_a3_index_kwargs(forward_batch, ratio)
             if candidate:
-                indices, _, blocks, lengths = _dsv41_a3_ops().candidate(
+                indices, _, blocks, lengths = _dsv41_a3_ops().indexer(
                     q_packed,
                     k,
                     w,
