@@ -32,7 +32,6 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
     get_a3_c2_state_bank_count,
 )
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
     DSV4IndexerBufferInfo,
     DSV4PagedBufferInfo,
