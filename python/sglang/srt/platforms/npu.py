@@ -1,6 +1,6 @@
 """NPU device operations for the SRT platform layer."""
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -88,3 +88,73 @@ class NPUSRTPlatform(NPUDeviceMixin, SRTPlatform):
         )
 
         destroy_mega_moe_buffers()
+
+    def supports_dsv41_bf16_kv_rows(self) -> bool:
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        return not is_npu_arch35()
+
+    def dsv4_kernel_num_heads(self, layer, num_tokens: int):
+        if not layer.is_dsv41:
+            return None
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        # A3 BF16 SMLA accepts the per-rank width (e.g. TP16/DP8: 32).
+        # The A5 mixed-quant kernel retains its 64-head padding.
+        return None if is_npu_arch35() else layer.n_local_heads
+
+    def request_window_nbytes(
+        self,
+        *,
+        num_slots: int,
+        layers: int,
+        page_size: int,
+        capacity: int,
+        workspace_rows: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        draft_ring_size: int,
+        draft_ring_layers: int,
+    ) -> Optional[int]:
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
+            NPUDSV4KVLayout,
+            npu_pool_pages,
+        )
+        from sglang.srt.hardware_backend.npu.dsv4.npu_request_window import (
+            NPURequestWindowSpec,
+            npu_workspace_rows,
+        )
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        row_layout = (
+            NPUDSV4KVLayout.V41_SWA_FP8 if is_npu_arch35() else NPUDSV4KVLayout.V41_BF16
+        )
+        # A draft worker runs the V4 sparse-attention op even on V4.1, so its
+        # ring rows keep the V4 row format (see DeepseekV4TokenToKVPool
+        # ._window_kv_layout); budget them separately from the target window.
+        draft_row_layout = (
+            NPUDSV4KVLayout.V4_FP8 if is_npu_arch35() else NPUDSV4KVLayout.V4_BF16
+        )
+        row_dim, row_dtype = row_layout.kv_info(qk_nope_head_dim, qk_rope_head_dim)
+        spec = NPURequestWindowSpec.create(
+            num_slots=num_slots,
+            layers=layers,
+            page_size=page_size,
+            capacity=capacity,
+            workspace_rows=npu_workspace_rows(
+                workspace_rows, num_slots=num_slots, page_size=page_size
+            ),
+            row_dim=row_dim,
+            row_dtype=row_dtype,
+        )
+        nbytes = spec.nbytes
+        if draft_ring_size and draft_ring_layers:
+            # Share the pool's page formula so the budget matches the
+            # allocation (whole pages plus one spare).
+            draft_dim, draft_dtype = draft_row_layout.kv_info(
+                qk_nope_head_dim, qk_rope_head_dim
+            )
+            ring_rows = npu_pool_pages(num_slots * draft_ring_size, page_size)
+            row_bytes = draft_dim * draft_dtype.itemsize
+            nbytes += ring_rows * page_size * draft_ring_layers * row_bytes
+        return nbytes

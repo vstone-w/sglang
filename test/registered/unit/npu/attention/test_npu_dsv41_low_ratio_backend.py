@@ -717,6 +717,37 @@ class TestRatioMetadata(unittest.TestCase):
         self.assertEqual(fm.c1_loc.tolist(), [200, 201, 202])
         self.assertEqual(fm.positions_cmp_padding_c1.tolist(), [0, 1, 2])
 
+    def test_ratio2_fold_keeps_the_compressor_group_order(self):
+        # Folded replay rows are still input rows to CompressorV2, so their
+        # groups must keep their output positions; only the writes are skipped.
+        batch = _batch(
+            positions=[0, 1, 2, 3, 4, 5],
+            out_cache_loc=[200, 201, 202, 203, 204, 205],
+            seq_lens=[6],
+            batch_size=1,
+        )
+        # Rows 0..3 are replay rows; rows 4, 5 are the new rows of the extend.
+        batch.encoder_swa_compress_rows = torch.tensor([4, 5])
+        fm = self._build(2, batch)
+        # Group closers are 1, 3, 5; the first two close on replay rows.
+        self.assertEqual(fm.positions_cmp_padding_c2.tolist(), [0, 2, 4, 0])
+        self.assertEqual(fm.c2_loc.tolist(), [-1, -1, 102, -1])
+
+    def test_ratio2_fold_group_can_start_on_a_replay_row(self):
+        # The (2,3) group pairs a replay row with a new row; its closing row is
+        # new, so it must be written (to the closing row's slot).
+        batch = _batch(
+            positions=[0, 1, 2, 3, 4, 5],
+            out_cache_loc=[200, 201, 202, 203, 204, 205],
+            seq_lens=[6],
+            batch_size=1,
+        )
+        # Rows 0..2 are replay rows; rows 3..5 are the new rows of the extend.
+        batch.encoder_swa_compress_rows = torch.tensor([3, 4, 5])
+        fm = self._build(2, batch)
+        self.assertEqual(fm.positions_cmp_padding_c2.tolist(), [0, 2, 4, 0])
+        self.assertEqual(fm.c2_loc.tolist(), [-1, 101, 102, -1])
+
     def test_padding_rows_are_skipped(self):
         # out_cache_loc 0 marks a DP padding row; it must never become a slot.
         batch = _batch(
@@ -1814,22 +1845,46 @@ class TestV41PoolWriteDispatch(unittest.TestCase):
                 False,
             )
 
+    def test_swa_buffer_parks_mlp_padding_rows_on_the_sink(self):
+        workspace = torch.ones(8, 512, dtype=torch.bfloat16)
+        window = SimpleNamespace(
+            prefill=True, buffer=lambda local: workspace, sink_row=7
+        )
+        ns = SimpleNamespace(
+            request_window=window,
+            _swa_local_layer_id=lambda layer_id: layer_id,
+            _dead_rows_to_sink=DSV4NPUTokenToKVPool._dead_rows_to_sink,
+            _window_kv_layout=lambda: NPUDSV4KVLayout.V41_BF16,
+        )
+        loc = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        cache = torch.ones(6, 512, dtype=torch.bfloat16)
+        DSV4NPUTokenToKVPool.set_swa_buffer(ns, 0, loc, cache)
+        # Valid rows land where the layout says; the extra MLP-sync row is
+        # zeroed and parked on the workspace sink.
+        torch.testing.assert_close(workspace[1:6], cache[:5])
+        torch.testing.assert_close(workspace[7], torch.zeros(512, dtype=torch.bfloat16))
+
     def test_swa_buffer_routes_a_v41_pool_to_the_fp8_writer(self):
         pool = _dsv41_llm_pool(544, torch.float8_e4m3fn, NPUDSV4KVLayout.V41_SWA_FP8)
         ns = SimpleNamespace(
-            swa_kv_pool=pool, _swa_local_layer_id=lambda layer_id: layer_id
+            swa_kv_pool=pool,
+            _swa_local_layer_id=lambda layer_id: layer_id,
+            request_window=None,
+            _dead_rows_to_sink=DSV4NPUTokenToKVPool._dead_rows_to_sink,
+            _swa_sink_row=lambda pool: 0,
         )
         writer = MagicMock()
         ns._write_dsv41_packed_kv = writer
         loc = torch.tensor([3], dtype=torch.int64)
         cache = torch.zeros(1, 1, 512, dtype=torch.bfloat16)
         DSV4NPUTokenToKVPool.set_swa_buffer(ns, 0, loc, cache)
-        writer.assert_called_once_with(
-            buf=pool.kv_buffer[0],
-            loc=loc,
-            cache=cache,
-            layout=NPUDSV4KVLayout.V41_SWA_FP8,
-        )
+        writer.assert_called_once()
+        kwargs = writer.call_args.kwargs
+        self.assertIs(kwargs["buf"], pool.kv_buffer[0])
+        torch.testing.assert_close(kwargs["loc"], loc)
+        # The dead-row filter rebuilds the payload tensor; compare contents.
+        torch.testing.assert_close(kwargs["cache"], cache)
+        self.assertEqual(kwargs["layout"], NPUDSV4KVLayout.V41_SWA_FP8)
 
 
 def _metadata_recorder(shape):
